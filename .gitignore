@@ -1,0 +1,4 @@
+*.agents
+.env
+*.md
+node_modules

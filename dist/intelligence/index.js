@@ -1,48 +1,61 @@
-import { getGeminiProbability } from './geminiOracle';
-import { getPythonProbability } from './pythonOracle';
+import { getGeminiProbability } from './geminiOracle.js';
+import { getPythonProbability } from './pythonOracle.js';
+// Gemini (evidence + search + resolution-criteria reasoning) dominates.
+// The Python service contributes a small on-chain flow signal at most —
+// its features (buy pressure, momentum, headline sentiment) are weak
+// evidence for literal resolution outcomes.
+const GEMINI_WEIGHT = 0.85;
+const PYTHON_MAX_WEIGHT = 0.15;
 /**
- * Combines predictions from Gemini NLP and Python ML service.
- *
- * Uses a weighted average:
- * - If the Python ML service returns a high confidence, weight it more.
- * - If the Python ML service is down, fall back to Gemini only.
- * - If Gemini is down (returns market price), and Python is up, use Python only.
+ * Combines Gemini and Python ML predictions.
+ * When Gemini reports the event is already concluded (post-deadline verification),
+ * the flow-based Python signal is ignored entirely — the outcome is a fact,
+ * not a forecast.
  */
-export async function getCombinedProbability(marketAddress, marketQuestion, articles, currentImpliedProb) {
-    // Run both intelligence engines in parallel
+export async function getCombinedProbability(market, articles, callGemini, marketContext = null) {
+    const currentImpliedProb = market.impliedProbabilities[0];
+    const geminiInput = {
+        question: market.question,
+        outcomes: market.outcomes,
+        category: market.category,
+        currentImpliedProb,
+        resolutionContext: market.resolutionContext,
+        dataSources: market.dataSources,
+        settlesAt: market.settlesAt,
+        resolvesAt: market.resolvesAt,
+        articles,
+        marketContext,
+    };
+    const geminiPromise = callGemini
+        ? getGeminiProbability(geminiInput)
+        : Promise.resolve({
+            probability: currentImpliedProb,
+            reasoning: "Gemini daily budget exhausted — no LLM evaluation.",
+            eventConcluded: false,
+        });
     const [geminiResult, pythonResult] = await Promise.all([
-        getGeminiProbability(marketQuestion, articles, currentImpliedProb),
-        getPythonProbability(marketAddress, currentImpliedProb, marketQuestion, articles.map(a => a.title)),
+        geminiPromise,
+        getPythonProbability(market.address, currentImpliedProb, market.question, articles.map(a => a.title)),
     ]);
     const geminiProb = geminiResult.probability;
-    const reasoning = geminiResult.reasoning;
-    if (pythonResult !== null) {
-        const pythonProb = pythonResult.probability;
-        const pythonConf = pythonResult.confidence;
-        // Weighted average: Python gets more weight if it's confident.
-        // Base weights: 60% Gemini (LLM is generally more capable), 40% Python ML.
-        // Adjust Python weight by its confidence.
-        const geminiWeight = 0.6;
-        const pythonWeight = 0.4 * (0.5 + pythonConf * 0.5); // Scale 0.2 to 0.4 based on confidence
-        const totalWeight = geminiWeight + pythonWeight;
-        const combined = (geminiProb * geminiWeight + pythonProb * pythonWeight) / totalWeight;
-        console.log(`  [Combined] Gemini: ${geminiProb.toFixed(4)} (w=${geminiWeight.toFixed(2)}) + Python: ${pythonProb.toFixed(4)} (w=${pythonWeight.toFixed(2)}) = ${combined.toFixed(4)}`);
+    if (pythonResult !== null && !geminiResult.eventConcluded) {
+        const pythonWeight = PYTHON_MAX_WEIGHT * Math.min(Math.max(pythonResult.confidence, 0), 1);
+        const totalWeight = GEMINI_WEIGHT + pythonWeight;
+        const combined = (geminiProb * GEMINI_WEIGHT + pythonResult.probability * pythonWeight) / totalWeight;
+        console.log(`  [Combined] Gemini: ${geminiProb.toFixed(4)} (w=${GEMINI_WEIGHT.toFixed(2)}) + Python: ${pythonResult.probability.toFixed(4)} (w=${pythonWeight.toFixed(2)}) = ${combined.toFixed(4)}`);
         return {
             probability: combined,
             geminiProb,
-            pythonProb,
-            reasoning,
-            pythonConfidence: pythonConf,
+            pythonProb: pythonResult.probability,
+            reasoning: geminiResult.reasoning,
+            eventConcluded: false,
         };
     }
-    else {
-        console.warn("  Python ML service unavailable. Using Gemini only.");
-        return {
-            probability: geminiProb,
-            geminiProb,
-            pythonProb: null,
-            reasoning,
-            pythonConfidence: null,
-        };
-    }
+    return {
+        probability: geminiProb,
+        geminiProb,
+        pythonProb: pythonResult?.probability ?? null,
+        reasoning: geminiResult.reasoning,
+        eventConcluded: geminiResult.eventConcluded,
+    };
 }

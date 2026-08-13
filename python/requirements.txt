@@ -1,7 +1,5 @@
 fastapi
 uvicorn
-scikit-learn
-pandas
 numpy
 requests
 textblob

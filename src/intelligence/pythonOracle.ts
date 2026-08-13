@@ -27,6 +27,7 @@ export async function getPythonProbability(
         const response = await fetch(`${pythonServiceUrl}/predict`, {
             method: 'POST',
             headers: { 'Content-Type': 'application/json' },
+            signal: AbortSignal.timeout(10_000),
             body: JSON.stringify({
                 market_address: marketAddress,
                 current_implied_prob: currentImpliedProb,
@@ -42,8 +43,9 @@ export async function getPythonProbability(
         const data: PythonPredictionResponse = await response.json();
         console.log(`  [Python ML] Prob: ${data.probability.toFixed(4)}, Confidence: ${data.confidence.toFixed(4)}, Method: ${data.method}`);
         return { probability: data.probability, confidence: data.confidence };
-    } catch (error) {
-        console.error("Error communicating with Python ML service:", error);
+    } catch (error: any) {
+        const msg = error?.cause?.code || error?.message || String(error);
+        console.warn(`  [Python ML] Service unavailable (${msg}) — continuing with Gemini only.`);
         return null;
     }
 }

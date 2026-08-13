@@ -1,4 +1,4 @@
-import { delphiClient } from './delphiClient';
+import { delphiClient } from './delphiClient.js';
 /**
  * Calculates how much it will cost to buy a certain number of shares.
  *

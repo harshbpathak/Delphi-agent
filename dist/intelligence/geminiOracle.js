@@ -1,97 +1,133 @@
-import { GoogleGenerativeAI } from '@google/generative-ai';
+import { GoogleGenAI } from '@google/genai';
 import * as dotenv from 'dotenv';
 dotenv.config();
 const apiKey = process.env.GEMINI_API_KEY;
 if (!apiKey) {
     console.warn("GEMINI_API_KEY is not set. Gemini Oracle will return default values.");
 }
-const genAI = new GoogleGenerativeAI(apiKey || 'dummy');
-const model = genAI.getGenerativeModel({ model: "gemini-2.5-flash" });
+const ai = new GoogleGenAI({ apiKey: apiKey || 'dummy' });
+const MODEL = "gemini-2.5-flash";
 const delay = (ms) => new Promise(res => setTimeout(res, ms));
-/**
- * Uses the Gemini LLM to analyze scraped news articles and produce a
- * probability estimate for a prediction market question.
- *
- * The prompt is structured to force strict analytical reasoning —
- * the model must justify its answer with evidence from the articles
- * before outputting the final probability.
- */
-export async function getGeminiProbability(marketQuestion, articles, currentImpliedProb, retries = 3) {
-    if (articles.length === 0) {
-        return { probability: currentImpliedProb, reasoning: "No new articles to analyze." };
-    }
-    const articleBlock = articles
-        .slice(0, 15) // Cap at 15 articles to stay within context limits
-        .map((a, i) => `[${i + 1}] "${a.title}" (${a.pubDate})\n    ${a.content}`)
-        .join('\n\n');
-    const prompt = `You are an expert quantitative analyst and prediction market trader.
+function buildPrompt(input) {
+    const nowIso = new Date().toISOString();
+    const articleBlock = input.articles.length > 0
+        ? input.articles
+            .slice(0, 15)
+            .map((a, i) => `[${i + 1}] "${a.title}" (${a.pubDate})\n    ${a.content}`)
+            .join('\n\n')
+        : "(none provided — rely on search and base rates)";
+    const criteriaBlock = input.resolutionContext
+        ? `OFFICIAL RESOLUTION/SETTLEMENT CONTEXT (apply this LITERALLY — settlement is done by AI judges applying these rules as written):\n${input.resolutionContext}`
+        : `No official resolution criteria were provided. INFER the likely resolution rules from the question. Prediction-market conventions: exact thresholds/margins/deadlines are applied literally; cancellation, postponement, or non-occurrence of the event typically resolves to the negative/second outcome.`;
+    return `You are an expert quantitative analyst pricing a prediction market. Settlement on this platform is performed by AI arbitrators who apply the written resolution criteria LITERALLY, using publicly verifiable evidence.
 
-MARKET QUESTION: "${marketQuestion}"
-CURRENT MARKET IMPLIED PROBABILITY (YES): ${(currentImpliedProb * 100).toFixed(1)}%
+CURRENT DATE AND TIME (UTC): ${nowIso}
 
-Below are ${articles.length} recent news articles related to this market. Analyze them carefully.
+MARKET QUESTION: "${input.question}"
+OUTCOME 0: "${input.outcomes[0]}"
+OUTCOME 1: "${input.outcomes[1]}"
+CATEGORY: ${input.category}
+MARKET IMPLIED PROBABILITY OF OUTCOME 0 ("${input.outcomes[0]}"): ${(input.currentImpliedProb * 100).toFixed(1)}%
+QUESTION RESOLVES AT: ${input.resolvesAt || 'unknown'}
+MARKET SETTLES AT: ${input.settlesAt || 'unknown'}
 
-ARTICLES:
+${criteriaBlock}
+
+DECLARED SETTLEMENT DATA SOURCES: ${input.dataSources || 'unknown'}
+
+ON-CHAIN MARKET SITUATION (other agents' order flow on this market — informative about crowding, NOT about the true outcome; agents herd and err):
+${input.marketContext || 'no flow data'}
+
+RECENT NEWS HEADLINES (may be incomplete or irrelevant):
 ${articleBlock}
 
-TASK:
-1. Identify which articles are directly relevant to the market question.
-2. For each relevant article, determine if it supports YES or NO and how strongly (weak/moderate/strong).
-3. Consider any conflicting signals.
-4. Synthesize your analysis into a final probability estimate.
+TASK — work through these steps:
+1. SCENARIO ENUMERATION: List every plausible outcome path (including edge cases: exact-threshold results, ties, cancellation, postponement, no official announcement in time) and which outcome each path pays under a literal reading of the rules.
+2. TIME AWARENESS: Compare the current UTC time above against any deadline in the question.
+   - If the deadline has ALREADY PASSED, the outcome is a matter of verifiable fact, not forecasting. Search for what actually happened and price near-certainty (0.95-0.99 in the confirmed direction). Set eventConcluded=true.
+   - If the question is "will X happen before T" and time is running out with no scheduled/likely occurrence, probability must decay toward the no-occurrence side accordingly.
+3. BASE RATES: For statistical questions (score margins, goal totals, temperature thresholds, price thresholds), start from historical base rates and distributions (e.g. league goal averages, climatological norms, asset volatility) and only adjust for concrete, specific evidence (announced lineups, weather forecasts, schedules). Headline TONE/sentiment is NOT evidence for quantitative questions.
+4. SEARCH: Use search to find decisive current facts (forecasts, schedules, official announcements, injury reports) relevant to the resolution criteria.
+5. SYNTHESIZE a final probability that OUTCOME 0 ("${input.outcomes[0]}") wins.
 
 IMPORTANT RULES:
-- Base your probability ONLY on the evidence in the articles above.
-- If the evidence is mixed or inconclusive, stay close to the current market price of ${(currentImpliedProb * 100).toFixed(1)}%.
-- If you have no clear edge, return the current market price.
+- If evidence is mixed, inconclusive or you have no clear edge, stay close to the current market price of ${(input.currentImpliedProb * 100).toFixed(1)}%.
 - Be honest about uncertainty. Do not fabricate confidence.
+- The probability MUST refer to OUTCOME 0 ("${input.outcomes[0]}"), not to "yes" in a colloquial sense.
 
-Respond in this exact JSON format:
-{
-  "probability": <float between 0.0 and 1.0>,
-  "reasoning": "<2-3 sentence summary of your analysis>"
-}`;
+Respond with ONLY a JSON object in exactly this format (no markdown fences, no extra text):
+{"probability": <float 0.0-1.0>, "reasoning": "<2-3 sentence summary>", "eventConcluded": <true|false>}`;
+}
+function extractJson(text) {
+    // Model may wrap JSON in fences or prose; grab the first {...} block.
+    const match = text.match(/\{[\s\S]*\}/);
+    if (!match)
+        return null;
+    try {
+        return JSON.parse(match[0]);
+    }
+    catch {
+        return null;
+    }
+}
+async function callGemini(prompt, useGrounding) {
+    const response = await ai.models.generateContent({
+        model: MODEL,
+        contents: prompt,
+        config: useGrounding
+            ? { tools: [{ googleSearch: {} }] }
+            : { responseMimeType: "application/json" },
+    });
+    return response.text || '';
+}
+/**
+ * Prices a market with Gemini. Tries a search-grounded call first (free-tier
+ * grounding), falling back to an ungrounded JSON call, falling back to the
+ * market price.
+ */
+export async function getGeminiProbability(input, retries = 3) {
+    if (!apiKey) {
+        return { probability: input.currentImpliedProb, reasoning: "No Gemini API key configured.", eventConcluded: false };
+    }
+    const prompt = buildPrompt(input);
+    let useGrounding = true;
     for (let attempt = 1; attempt <= retries; attempt++) {
         try {
-            const result = await model.generateContent({
-                contents: [{ role: 'user', parts: [{ text: prompt }] }],
-                generationConfig: { responseMimeType: "application/json" }
-            });
-            const responseText = result.response.text();
-            const data = JSON.parse(responseText);
-            if (typeof data.probability === 'number' && data.probability >= 0 && data.probability <= 1) {
-                console.log(`  [Gemini] Prob: ${data.probability.toFixed(4)}, Reasoning: ${data.reasoning}`);
+            const responseText = await callGemini(prompt, useGrounding);
+            const data = extractJson(responseText);
+            if (data && typeof data.probability === 'number' && data.probability >= 0 && data.probability <= 1) {
+                console.log(`  [Gemini${useGrounding ? '+search' : ''}] P(${input.outcomes[0]}): ${data.probability.toFixed(4)} | concluded: ${!!data.eventConcluded} | ${data.reasoning}`);
                 return {
                     probability: data.probability,
-                    reasoning: data.reasoning || "No reasoning provided."
+                    reasoning: data.reasoning || "No reasoning provided.",
+                    eventConcluded: !!data.eventConcluded,
                 };
             }
-            else {
-                throw new Error(`Invalid probability value from Gemini: ${data.probability}`);
-            }
+            throw new Error(`Invalid/unparseable Gemini response: ${responseText.slice(0, 200)}`);
         }
         catch (error) {
-            const isRateLimit = error?.status === 429 || error?.message?.includes('429');
-            const isServerError = error?.status >= 500;
+            const msg = error?.message || String(error);
+            const isRateLimit = error?.status === 429 || msg.includes('429') || msg.includes('RESOURCE_EXHAUSTED');
+            const isServerError = (error?.status >= 500) || msg.includes('500') || msg.includes('503');
+            // If the grounded call is what failed (tool unsupported / quota), drop grounding.
+            if (useGrounding && !isRateLimit && !isServerError) {
+                console.warn(`  [Gemini] Grounded call failed (${msg.slice(0, 120)}). Retrying without search grounding.`);
+                useGrounding = false;
+                continue; // does not consume backoff
+            }
             if (attempt === retries) {
                 console.error(`Gemini Oracle failed after ${retries} attempts. Returning market price as fallback.`);
-                return { probability: currentImpliedProb, reasoning: "Gemini API unavailable. Returning market price." };
+                return { probability: input.currentImpliedProb, reasoning: "Gemini API unavailable. Returning market price.", eventConcluded: false };
             }
-            // Exponential backoff: 2s, 4s, 8s... with jitter
-            const baseMs = Math.pow(2, attempt) * 1000;
-            const jitter = Math.random() * 1000;
-            const backoffMs = baseMs + jitter;
+            const backoffMs = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
             if (isRateLimit) {
                 console.warn(`Gemini rate limited (429). Backing off ${(backoffMs / 1000).toFixed(1)}s...`);
             }
-            else if (isServerError) {
-                console.warn(`Gemini server error (${error?.status}). Retrying in ${(backoffMs / 1000).toFixed(1)}s...`);
-            }
             else {
-                console.error(`Gemini error (attempt ${attempt}):`, error.message || error);
+                console.warn(`Gemini error (attempt ${attempt}): ${msg.slice(0, 200)}. Retrying in ${(backoffMs / 1000).toFixed(1)}s...`);
             }
             await delay(backoffMs);
         }
     }
-    return { probability: currentImpliedProb, reasoning: "Exhausted retries." };
+    return { probability: input.currentImpliedProb, reasoning: "Exhausted retries.", eventConcluded: false };
 }

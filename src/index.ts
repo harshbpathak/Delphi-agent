@@ -152,6 +152,88 @@ async function sweepSettledPositions() {
     }
 }
 
+// ─── Exit Manager: pay yourself when the edge is exhausted ───────────────────
+const EXIT_EDGE_THRESHOLD = 0.01; // Sell when remaining net edge < 1% (fees make holding -EV vs redeploying)
+const SELL_SLIPPAGE_BPS = 200n;
+
+/**
+ * For every open position on a still-open market: if the market price has
+ * converged to (or moved past) our predicted probability, the remaining edge
+ * is gone — sell, lock the profit/loss, and free the capital immediately
+ * instead of waiting days for oracle settlement. This also exits reversals:
+ * if a later evaluation moved our estimate below the price, remaining edge is
+ * negative and the position is sold.
+ */
+async function exitExhaustedPositions(markets: EnrichedMarket[]) {
+    let signer;
+    try {
+        signer = await delphiClient.getSigner();
+    } catch { return; }
+
+    let positions;
+    try {
+        ({ positions } = await delphiClient.listPositions({
+            wallet: signer.address,
+            redeemedOrLiquidated: false,
+        }));
+    } catch { return; }
+    if (!positions || positions.length === 0) return;
+
+    for (const pos of positions) {
+        try {
+            const market = markets.find(m => m.address.toLowerCase() === pos.marketProxy.toLowerCase());
+            if (!market) continue; // not open — the settlement sweep handles it
+
+            const idx = Number(pos.outcomeIdx);
+            const sharesIn = BigInt(pos.shares);
+            const sharesNum = Number(pos.shares) / 1e18;
+            if (sharesNum < 0.01) continue;
+
+            const price = market.spotPrices[idx];
+            if (price === undefined) continue;
+
+            const lastEval = await getLastEvaluation(market.address);
+            if (!lastEval) continue;
+            const pOut = idx === 0 ? lastEval.predicted_prob : 1 - lastEval.predicted_prob;
+
+            const remainingEdge = netEdge(pOut, price, market.tradingFee);
+            if (remainingEdge >= EXIT_EDGE_THRESHOLD) continue; // still has edge — keep holding
+
+            // Quote the exit and sanity-check sell-side slippage.
+            const { tokensOut } = await delphiClient.quoteSell({
+                marketAddress: market.address as `0x${string}`,
+                outcomeIdx: idx,
+                sharesIn,
+            });
+            const proceeds = tokensFromBigint(tokensOut);
+            const sellEffPrice = proceeds / sharesNum;
+            if (sellEffPrice < price * 0.9) {
+                console.log(`   ⏭️  Exit skipped for ${market.address}: sell-side slippage too deep (${sellEffPrice.toFixed(3)} vs spot ${price.toFixed(3)}).`);
+                continue;
+            }
+
+            const minTokensOut = tokensOut * (10_000n - SELL_SLIPPAGE_BPS) / 10_000n;
+
+            console.log(`💸 Exiting "${market.question.slice(0, 60)}" — ${sharesNum.toFixed(2)} × "${market.outcomes[idx]}" @ ~${sellEffPrice.toFixed(3)} (${proceeds.toFixed(2)} TST). Remaining edge ${(remainingEdge * 100).toFixed(2)}% < ${(EXIT_EDGE_THRESHOLD * 100).toFixed(0)}%.`);
+
+            if (!DRY_RUN) {
+                await delphiClient.sellShares({
+                    marketAddress: market.address as `0x${string}`,
+                    outcomeIdx: idx,
+                    sharesIn,
+                    minTokensOut,
+                });
+            }
+
+            await recordSettlement(pos.marketProxy, 'sell', proceeds);
+            logEvent('SELL', `${sharesNum.toFixed(2)} "${market.outcomes[idx]}" @ ${sellEffPrice.toFixed(3)} → +${proceeds.toFixed(2)} TST — edge exhausted (${(remainingEdge * 100).toFixed(1)}%) — "${market.question.slice(0, 60)}"${DRY_RUN ? ' [DRY]' : ''}`);
+            await notify(`💸 *SOLD* ${sharesNum.toFixed(1)} × "${market.outcomes[idx]}" for *${proceeds.toFixed(2)} TST*\n_${market.question.slice(0, 90)}_\nEdge exhausted — capital freed for redeployment.`);
+        } catch (e) {
+            console.error(`  Exit check failed for ${pos.marketProxy}:`, (e as Error).message?.slice(0, 150));
+        }
+    }
+}
+
 // ─── Circuit Breaker ─────────────────────────────────────────────────────────
 /** Losing streaks are guaranteed even with a real edge; this distinguishes
  *  normal variance from "the model is broken" and halts on the latter. */
@@ -434,6 +516,13 @@ async function runLoop() {
     //    keeps the realized-PnL journal current for the circuit breaker.
     await sweepSettledPositions();
 
+    // 1b. Scan open markets (earliest-settling first), then exit any position
+    //     whose edge is exhausted — freed capital is reflected in the bankroll
+    //     fetched right after.
+    const markets = await scanOpenMarkets();
+    lastMarkets = markets;
+    await exitExhaustedPositions(markets);
+
     // 2. Bankroll
     let bankroll = 0;
     try {
@@ -472,9 +561,7 @@ async function runLoop() {
         return;
     }
 
-    // 4. Scan (earliest-settling first) + refresh the market-situation picture
-    const markets = await scanOpenMarkets();
-    lastMarkets = markets;
+    // 4. Refresh the market-situation picture
     const newTrades = await pollAllTrades();
     const posture = await getCompetitionPosture(markets);
     lastPosture = posture;

@@ -164,7 +164,7 @@ export async function getOpenCost(marketAddress: string): Promise<number> {
     return row?.cost || 0;
 }
 
-export async function recordSettlement(marketAddress: string, kind: 'redeem' | 'liquidate', proceedsTokens: number) {
+export async function recordSettlement(marketAddress: string, kind: 'redeem' | 'liquidate' | 'sell', proceedsTokens: number) {
     const cost = await getOpenCost(marketAddress);
     await db.run(
         `INSERT INTO settlements (market_address, kind, proceeds_tokens, cost_tokens, pnl_tokens, settled_at)

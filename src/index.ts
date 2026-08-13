@@ -5,7 +5,7 @@ import {
     initDatabase, getState, setState,
     getLastEvaluation, saveEvaluation,
     recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot,
-    openCostByCategory, getOpenEntry,
+    openCostByCategory, getOpenEntry, performanceStats,
 } from './persistence/db.js';
 import { scanOpenMarkets, EnrichedMarket } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles, ScrapedArticle } from './ingestion/rssScraper.js';
@@ -280,6 +280,31 @@ interface TradeCandidate {
     spotPrice: number;
     /** Provisional net edge at spot price (before slippage) */
     provisionalEdge: number;
+    /** Trades on this market in the last 24h (thin-market signal) */
+    flowTrades24h: number;
+    /** Crowd has been buying the OPPOSITE side hard (fade-the-herd signal) */
+    crowdBoost: boolean;
+}
+
+/**
+ * EV ranking score (report §3): base = net edge, boosted for
+ *  ×1.5 deterministic facts (event already concluded — near-zero variance),
+ *  ×1.2 thin markets (uncontested mispricings persist),
+ *  ×1.15 crowd piling onto the side we fade (their flow cheapened our side).
+ */
+function scoreCandidate(c: TradeCandidate): number {
+    let s = c.provisionalEdge;
+    if (c.prediction.eventConcluded) s *= 1.5;
+    if (c.flowTrades24h < 20) s *= 1.2;
+    if (c.crowdBoost) s *= 1.15;
+    return s;
+}
+
+/** Crowd-against-us: rivals bought the opposite outcome ≥3× harder than ours. */
+function computeCrowdBoost(outcomeIdx: number, buyVol0: number, buyVol1: number): boolean {
+    const ours = outcomeIdx === 0 ? buyVol0 : buyVol1;
+    const theirs = outcomeIdx === 0 ? buyVol1 : buyVol0;
+    return theirs > 20 && theirs > ours * 3;
 }
 
 function hoursUntil(iso: string | null): number | null {
@@ -310,7 +335,7 @@ async function shouldEvaluate(market: EnrichedMarket, articles: ScrapedArticle[]
 const EVAL_FRESHNESS_MS = 2 * 60 * 60 * 1000;
 
 /** Build a candidate from a stored evaluation, re-priced at the CURRENT market price. */
-function candidateFromStoredEval(market: EnrichedMarket, predictedProb: number): TradeCandidate | null {
+async function candidateFromStoredEval(market: EnrichedMarket, predictedProb: number): Promise<TradeCandidate | null> {
     const currentImpliedProb = market.impliedProbabilities[0]!;
     const grossEdge = predictedProb - currentImpliedProb;
     const outcomeIdx = grossEdge > 0 ? 0 : 1;
@@ -318,6 +343,7 @@ function candidateFromStoredEval(market: EnrichedMarket, predictedProb: number):
     const spotPrice = market.spotPrices[outcomeIdx] ?? (outcomeIdx === 0 ? currentImpliedProb : 1 - currentImpliedProb);
     const provisionalEdge = netEdge(effectiveProb, spotPrice, market.tradingFee);
     if (provisionalEdge < DEFAULT_GUARDRAILS.minEdgeThreshold) return null;
+    const flow = await getMarketFlow(market.address);
     return {
         market,
         prediction: {
@@ -328,6 +354,8 @@ function candidateFromStoredEval(market: EnrichedMarket, predictedProb: number):
             eventConcluded: false,
         },
         outcomeIdx, effectiveProb, spotPrice, provisionalEdge,
+        flowTrades24h: flow.trades24h,
+        crowdBoost: computeCrowdBoost(outcomeIdx, flow.buyVolOutcome0, flow.buyVolOutcome1),
     };
 }
 
@@ -348,7 +376,7 @@ async function evaluateMarkets(markets: EnrichedMarket[], guardrails: RiskGuardr
             // still disagree with the current price enough to trade on.
             const lastEval = await getLastEvaluation(market.address);
             if (lastEval && Date.now() - lastEval.evaluated_at < EVAL_FRESHNESS_MS) {
-                const cached = candidateFromStoredEval(market, lastEval.predicted_prob);
+                const cached = await candidateFromStoredEval(market, lastEval.predicted_prob);
                 if (cached) {
                     console.log(`📎 Cached candidate: "${market.question}" — net edge ${(cached.provisionalEdge * 100).toFixed(2)}% (evaluated ${((Date.now() - lastEval.evaluated_at) / 60000).toFixed(0)}m ago)`);
                     candidates.push(cached);
@@ -409,7 +437,11 @@ async function evaluateMarkets(markets: EnrichedMarket[], guardrails: RiskGuardr
         logEvent('THINK', `"${market.question.slice(0, 70)}" → P=${(prediction.probability * 100).toFixed(1)}% vs mkt ${(currentImpliedProb * 100).toFixed(1)}% | edge ${(provisionalEdge * 100).toFixed(1)}% on "${market.outcomes[outcomeIdx]}" — ${prediction.reasoning.slice(0, 140)}`);
 
         if (provisionalEdge >= guardrails.minEdgeThreshold) {
-            candidates.push({ market, prediction, outcomeIdx, effectiveProb, spotPrice, provisionalEdge });
+            candidates.push({
+                market, prediction, outcomeIdx, effectiveProb, spotPrice, provisionalEdge,
+                flowTrades24h: flow.trades24h,
+                crowdBoost: computeCrowdBoost(outcomeIdx, flow.buyVolOutcome0, flow.buyVolOutcome1),
+            });
         } else if (provisionalEdge > 0) {
             logEvent('SKIP', `"${market.question.slice(0, 60)}": edge ${(provisionalEdge * 100).toFixed(1)}% below ${(guardrails.minEdgeThreshold * 100).toFixed(0)}% threshold`);
         }
@@ -421,9 +453,20 @@ async function evaluateMarkets(markets: EnrichedMarket[], guardrails: RiskGuardr
 }
 
 // ─── Execution Phase ─────────────────────────────────────────────────────────
+const MAX_ENTRY_PRICE = 0.92;        // DON'T chase: never buy above 0.92 unless the fact is verified
+const VERIFIED_FACT_BET_PCT = 0.15;  // Deterministic-fact trades earn a larger cap (still hard-capped)
+const MIN_TRADE_PROFIT_TST = 0.5;    // DON'T churn: skip trades whose expected profit can't clear fees meaningfully
+
 async function executeCandidate(c: TradeCandidate, bankroll: number, guardrails: RiskGuardrails): Promise<number> {
     const { market, outcomeIdx } = c;
     const label = market.outcomes[outcomeIdx]!;
+
+    // Verified facts (event concluded, ≥95% conviction) justify pushing the
+    // price further toward belief — larger cap, every other check unchanged.
+    const isVerifiedFact = c.prediction.eventConcluded && c.effectiveProb >= 0.95;
+    if (isVerifiedFact) {
+        guardrails = { ...guardrails, maxSingleBetPct: Math.max(guardrails.maxSingleBetPct, VERIFIED_FACT_BET_PCT) };
+    }
 
     // Correlation guard: cap open exposure per category.
     const exposure = await openCostByCategory();
@@ -458,6 +501,14 @@ async function executeCandidate(c: TradeCandidate, bankroll: number, guardrails:
         return 0;
     }
 
+    // DON'T chase near-certain prices without verification: buying at 0.95
+    // risks 19:1 downside on any settlement surprise.
+    if (effectivePrice > MAX_ENTRY_PRICE && !isVerifiedFact) {
+        console.log(`   ⏭️  Entry price ${effectivePrice.toFixed(3)} > ${MAX_ENTRY_PRICE} without verified fact. Skipping (asymmetric downside).`);
+        logEvent('SKIP', `"${market.question.slice(0, 60)}": price ${effectivePrice.toFixed(2)} too high without verification`);
+        return 0;
+    }
+
     // Re-size on the effective price; scale the order down if needed.
     const finalTokens = calculatePositionSize(
         c.effectiveProb, effectivePrice, market.tradingFee, bankroll, guardrails
@@ -479,6 +530,14 @@ async function executeCandidate(c: TradeCandidate, bankroll: number, guardrails:
     const maxTokensIn = tokensIn * (10_000n + MAX_SLIPPAGE_BPS) / 10_000n;
     const costHuman = tokensFromBigint(tokensIn);
     const maxCostHuman = tokensFromBigint(maxTokensIn);
+
+    // DON'T churn: expected profit must clear the fee hurdle by a real margin.
+    const expectedProfit = edgeAfterSlippage * sharesFromBigint(sharesOut);
+    if (expectedProfit < MIN_TRADE_PROFIT_TST) {
+        console.log(`   ⏭️  Expected profit ${expectedProfit.toFixed(3)} TST below ${MIN_TRADE_PROFIT_TST} floor — dust trade, fees would dominate. Skipping.`);
+        logEvent('SKIP', `"${market.question.slice(0, 60)}": expected profit ${expectedProfit.toFixed(2)} TST too small`);
+        return 0;
+    }
 
     // Hard safety cap — enforced against the worst-case (max slippage) spend.
     const maxAllowedSpend = bankroll * guardrails.maxSingleBetPct * (1 + Number(MAX_SLIPPAGE_BPS) / 10_000);
@@ -583,19 +642,28 @@ async function runLoop() {
     const newTrades = await pollAllTrades();
     const posture = await getCompetitionPosture(markets);
     lastPosture = posture;
-    activeGuardrails = postureAdjustedGuardrails(posture, bankroll);
+    const perf = await performanceStats();
+    activeGuardrails = postureAdjustedGuardrails(posture, bankroll, perf);
 
     console.log(`📊 Found ${markets.length} open binary markets with live price data.`);
     console.log(`🌐 Situation: +${newTrades} new competitor trades indexed | ${posture.summary}`);
-    console.log(`🎚️  Risk posture: fractional Kelly ${activeGuardrails.fractionalKelly} (rank-aware)`);
+    console.log(`🎚️  Risk posture: Kelly ${activeGuardrails.fractionalKelly} | max bet ${(activeGuardrails.maxSingleBetPct * 100).toFixed(0)}% | closed ${perf.settled} (win rate ${(perf.winRate * 100).toFixed(0)}%, net ${perf.netPnl.toFixed(1)})`);
     console.log(`🔒 Daily Usage: Trades [${dailyTradeCount}/${MAX_DAILY_TRADES}] | Gemini [${dailyGeminiCallCount}/${MAX_DAILY_GEMINI_CALLS}]`);
 
     // 5. Evaluate → rank by net edge → execute the BEST candidates, not the
     //    first encountered ("act on your edges without cherry-picking").
     const candidates = await evaluateMarkets(markets, activeGuardrails);
-    candidates.sort((a, b) => b.provisionalEdge - a.provisionalEdge);
+    candidates.sort((a, b) => scoreCandidate(b) - scoreCandidate(a));
 
     console.log(`\n🏁 ${candidates.length} candidate(s) clear the net-edge threshold.`);
+    for (const c of candidates.slice(0, 5)) {
+        const tags = [
+            c.prediction.eventConcluded ? 'FACT×1.5' : null,
+            c.flowTrades24h < 20 ? 'THIN×1.2' : null,
+            c.crowdBoost ? 'FADE×1.15' : null,
+        ].filter(Boolean).join(' ');
+        console.log(`   ${(scoreCandidate(c) * 100).toFixed(1)} pts | edge ${(c.provisionalEdge * 100).toFixed(1)}% ${tags ? '| ' + tags : ''} | "${c.market.question.slice(0, 55)}"`);
+    }
 
     let loopTradesExecuted = 0;
     let liquidBankroll = bankroll;

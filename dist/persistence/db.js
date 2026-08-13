@@ -200,3 +200,13 @@ export async function performanceSnapshot() {
     const t = await db.get(`SELECT COUNT(*) AS n FROM trades WHERE dry_run = 0`);
     return { settled: s?.n || 0, netPnl: s?.pnl || 0, totalTrades: t?.n || 0 };
 }
+/** Realized performance for the calibration-gated sizing rule:
+ *  win rate and net PnL over all closed positions (sell/redeem/liquidate). */
+export async function performanceStats() {
+    const s = await db.get(`SELECT COUNT(*) AS n,
+                COALESCE(SUM(pnl_tokens), 0) AS pnl,
+                COALESCE(SUM(CASE WHEN pnl_tokens > 0 THEN 1 ELSE 0 END), 0) AS wins
+         FROM settlements`);
+    const n = s?.n || 0;
+    return { settled: n, netPnl: s?.pnl || 0, winRate: n > 0 ? (s?.wins || 0) / n : 0 };
+}

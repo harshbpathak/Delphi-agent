@@ -2,20 +2,40 @@ import { RiskGuardrails, DEFAULT_GUARDRAILS } from './kellyCalculator.js';
 import { CompetitionPosture } from '../intelligence/marketContext.js';
 
 /**
- * Gap-aware risk posture.
+ * Gap-aware, calibration-gated, endgame-aware risk posture.
  *
- * Ranking is PnL, so the competition is a race, not an absolute-return
- * exercise. Behind the leader → tolerate slightly more variance (higher
- * fractional Kelly). Near the top → protect the position. All adjustments
- * stay inside hard bounds; the 5% single-trade cap, minimum-edge threshold
- * and circuit breaker are NEVER relaxed.
+ * Ranking is PnL, the prize is TOP THREE, so the objective is expected RANK,
+ * not expected wealth:
+ *  - Behind → tolerate more EV-positive variance (higher fractional Kelly).
+ *  - Podium → protect (lower Kelly).
+ *  - PROVEN calibration (≥20 closed positions, profitable, ≥55% win rate)
+ *    unlocks a higher Kelly: same decision quality, bigger extraction.
+ *  - FINAL 48 HOURS (set COMPETITION_END in .env, ISO date): if just below
+ *    #3, concentrate; if holding a podium spot, freeze into protection.
+ *
+ * The minimum-edge threshold, category exposure cap and circuit breaker are
+ * NEVER relaxed by this module.
  */
 
-const KELLY_MIN = 0.15;
-const KELLY_MAX = 0.35;
+const KELLY_MIN = 0.12;
+const KELLY_MAX = 0.50;
 
-export function postureAdjustedGuardrails(posture: CompetitionPosture, bankroll: number): RiskGuardrails {
-    let kelly = DEFAULT_GUARDRAILS.fractionalKelly;
+export interface RealizedPerformance {
+    settled: number;
+    netPnl: number;
+    winRate: number;
+}
+
+const PROVEN_MIN_SETTLED = 20;
+const PROVEN_MIN_WINRATE = 0.55;
+
+export function postureAdjustedGuardrails(
+    posture: CompetitionPosture,
+    bankroll: number,
+    perf: RealizedPerformance
+): RiskGuardrails {
+    let kelly = DEFAULT_GUARDRAILS.fractionalKelly; // 0.25
+    let maxBet = DEFAULT_GUARDRAILS.maxSingleBetPct;
 
     if (posture.ourRank !== null) {
         if (posture.ourRank <= 3) {
@@ -27,8 +47,33 @@ export function postureAdjustedGuardrails(posture: CompetitionPosture, bankroll:
         }
     }
 
+    // Calibration gate: once the journal PROVES the edge is real, size up.
+    const proven = perf.settled >= PROVEN_MIN_SETTLED && perf.netPnl > 0 && perf.winRate >= PROVEN_MIN_WINRATE;
+    if (proven && posture.ourRank !== null && posture.ourRank > 3) {
+        kelly = Math.max(kelly, 0.40);
+    }
+
+    // Endgame: optimize expected rank, not expected PnL.
+    const endIso = process.env.COMPETITION_END;
+    const endTs = endIso ? Date.parse(endIso) : NaN;
+    if (!isNaN(endTs)) {
+        const hoursLeft = (endTs - Date.now()) / 3600_000;
+        if (hoursLeft > 0 && hoursLeft <= 48 && posture.ourRank !== null) {
+            if (posture.ourRank <= 3) {
+                // Holding a prize spot: variance only hurts now.
+                kelly = 0.12;
+                maxBet = 0.05;
+            } else if (posture.gapToThird > 0 && posture.gapToThird <= bankroll * 0.8) {
+                // Within striking distance of the money: concentrate.
+                kelly = 0.50;
+                maxBet = 0.15;
+            }
+        }
+    }
+
     return {
         ...DEFAULT_GUARDRAILS,
         fractionalKelly: Math.min(KELLY_MAX, Math.max(KELLY_MIN, kelly)),
+        maxSingleBetPct: maxBet,
     };
 }

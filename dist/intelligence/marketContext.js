@@ -148,15 +148,17 @@ export async function getCompetitionPosture(openMarkets) {
         const rows = await fetchOfficialLeaderboard();
         const ours = rows.find(r => r.address === us) ?? null;
         const leader = rows[0] ?? null;
+        const third = rows[2] ?? null;
         const posture = {
             ourRank: ours?.rank ?? null,
             ourPnl: ours?.pnl ?? 0,
             leaderPnl: leader?.pnl ?? 0,
             leaderWallet: leader?.address ?? null,
             gapToLeader: (leader?.pnl ?? 0) - (ours?.pnl ?? 0),
+            gapToThird: (third?.pnl ?? 0) - (ours?.pnl ?? 0),
             summary: '',
         };
-        posture.summary = `[official] Rank ${posture.ourRank ?? '?'}/${rows.length} | our PnL ${posture.ourPnl.toFixed(2)} | leader "${leader?.name}" ${posture.leaderPnl.toFixed(1)} | gap ${posture.gapToLeader.toFixed(1)} TST`;
+        posture.summary = `[official] Rank ${posture.ourRank ?? '?'}/${rows.length} | our PnL ${posture.ourPnl.toFixed(2)} | #3 gap ${posture.gapToThird.toFixed(1)} | leader "${leader?.name}" gap ${posture.gapToLeader.toFixed(1)} TST`;
         return posture;
     }
     catch (e) {
@@ -174,12 +176,13 @@ export async function getCompetitionPosture(openMarkets) {
             leaderPnl: leader?.pnl ?? 0,
             leaderWallet: leader?.wallet ?? null,
             gapToLeader: (leader?.pnl ?? 0) - (ours?.pnl ?? 0),
+            gapToThird: (standings[2]?.pnl ?? 0) - (ours?.pnl ?? 0),
             summary: '',
         };
         posture.summary = `[estimate] Rank ${posture.ourRank ?? '?'}/${standings.length} | our PnL ${posture.ourPnl.toFixed(1)} | leader ${posture.leaderPnl.toFixed(1)} | gap ${posture.gapToLeader.toFixed(1)} TST`;
         return posture;
     }
     catch {
-        return { ourRank: null, ourPnl: 0, leaderPnl: 0, leaderWallet: null, gapToLeader: 0, summary: 'standings unavailable' };
+        return { ourRank: null, ourPnl: 0, leaderPnl: 0, leaderWallet: null, gapToLeader: 0, gapToThird: 0, summary: 'standings unavailable' };
     }
 }

@@ -1,6 +1,6 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
-import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, } from './persistence/db.js';
+import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, getOpenEntry, } from './persistence/db.js';
 import { scanOpenMarkets } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles } from './ingestion/rssScraper.js';
 import { getCombinedProbability } from './intelligence/index.js';

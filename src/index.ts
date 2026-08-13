@@ -5,7 +5,7 @@ import {
     initDatabase, getState, setState,
     getLastEvaluation, saveEvaluation,
     recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot,
-    openCostByCategory,
+    openCostByCategory, getOpenEntry,
 } from './persistence/db.js';
 import { scanOpenMarkets, EnrichedMarket } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles, ScrapedArticle } from './ingestion/rssScraper.js';

@@ -1,0 +1,45 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <style>
+        body { background: #000; color: #fff; text-align: center; font-family: sans-serif; padding-top: 30px; }
+        button { padding: 12px 24px; font-size: 16px; background: #00F2FE; color: #000; font-weight: bold; border: none; border-radius: 6px; cursor: pointer; margin-top: 20px; }
+    </style>
+</head>
+<body>
+    <svg id="svg" xmlns="http://www.w3.org/2000/svg" viewBox="0 0 500 500" width="350" height="350">
+      <defs>
+        <linearGradient id="bg" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#0B0F19"/><stop offset="100%" stop-color="#070A10"/></linearGradient>
+        <linearGradient id="grad" x1="0%" y1="0%" x2="100%" y2="100%"><stop offset="0%" stop-color="#00F2FE"/><stop offset="100%" stop-color="#4FACFE"/></linearGradient>
+      </defs>
+      <rect width="500" height="500" rx="30" fill="url(#bg)"/>
+      <polygon points="250,40 430,140 430,360 250,460 70,360 70,140" fill="#111827" stroke="url(#grad)" stroke-width="6"/>
+      <polygon points="250,55 415,150 415,350 250,445 85,350 85,150" fill="none" stroke="#4FACFE" stroke-width="2" stroke-dasharray="6,6"/>
+      <path d="M 100,320 Q 180,240 250,290 T 400,220" fill="none" stroke="url(#grad)" stroke-width="4"/>
+      <rect x="120" y="180" width="260" height="110" rx="20" fill="#0B0F19" stroke="url(#grad)" stroke-width="3"/>
+      <text x="250" y="255" font-size="64" font-weight="900" fill="#FFFFFF" text-anchor="middle">MHA</text>
+      <text x="250" y="380" font-size="14" font-weight="700" fill="#9CA3AF" text-anchor="middle">AUTONOMOUS TRADING AGENT</text>
+    </svg>
+    <br>
+    <button onclick="download()">Download MHA Logo PNG</button>
+    <script>
+      function download() {
+        const svg = document.getElementById('svg');
+        const canvas = document.createElement('canvas');
+        canvas.width = 1000; canvas.height = 1000;
+        const ctx = canvas.getContext('2d');
+        const img = new Image();
+        const xml = new XMLSerializer().serializeToString(svg);
+        const url = URL.createObjectURL(new Blob([xml], {type: 'image/svg+xml;charset=utf-8'}));
+        img.onload = function() {
+          ctx.drawImage(img, 0, 0, 1000, 1000);
+          const a = document.createElement('a');
+          a.download = 'MHA_Agent_Logo.png';
+          a.href = canvas.toDataURL('image/png');
+          a.click();
+        };
+        img.src = url;
+      }
+    </script>
+</body>
+</html>

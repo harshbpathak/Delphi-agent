@@ -682,10 +682,10 @@ async function runLoop() {
         }
     }
 
-    const perf = await performanceSnapshot();
+    const snap = await performanceSnapshot();
     console.log(`\n${'═'.repeat(70)}`);
     console.log(`✅ Loop finished. Trades: ${loopTradesExecuted}/${MAX_TRADES_PER_LOOP} this loop, ${dailyTradeCount}/${MAX_DAILY_TRADES} today.`);
-    console.log(`📒 Journal: ${perf.totalTrades} live trades, ${perf.settled} settled, net PnL ${perf.netPnl.toFixed(4)} tokens.`);
+    console.log(`📒 Journal: ${snap.totalTrades} live trades, ${snap.settled} settled, net PnL ${snap.netPnl.toFixed(4)} tokens.`);
     console.log(`⏳ Next loop in ${POLL_INTERVAL_MS / 1000}s...`);
     console.log(`${'═'.repeat(70)}\n`);
 }

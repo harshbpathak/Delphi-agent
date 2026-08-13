@@ -14,7 +14,10 @@ module.exports = {
         },
         {
             name: 'mha-python',
-            script: 'python3',
+            // PYTHON_BIN lets the same file work everywhere:
+            //   VM:      PYTHON_BIN=.venv/bin/python pm2 start ecosystem.config.cjs
+            //   Windows: pm2 start ecosystem.config.cjs   (falls back to python3/python)
+            script: process.env.PYTHON_BIN || (process.platform === 'win32' ? 'python' : 'python3'),
             args: '-m uvicorn main:app --host 127.0.0.1 --port 8000',
             cwd: `${__dirname}/python`,
             interpreter: 'none',

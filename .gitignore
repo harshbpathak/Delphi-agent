@@ -2,3 +2,4 @@
 .env
 *.md
 node_modules
+*.pem

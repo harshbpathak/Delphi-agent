@@ -30,103 +30,89 @@ interface RawRedemption {
     wallet?: string | null; tokensOut?: string | null;
 }
 
-/** Pull all new trades (every wallet) since the last poll into competitor_trades.
- *  Paginates up to MAX_PAGES per call so the initial backfill of the whole
- *  competition history completes within a couple of loops. */
-export async function pollAllTrades(): Promise<number> {
-    const MAX_PAGES = 8;
-    let total = 0;
-    for (let page = 0; page < MAX_PAGES; page++) {
-        const stored = await pollTradesPage();
-        total += stored;
-        if (stored < POLL_PAGE) break; // caught up
-    }
-    return total;
+interface EntitySpec {
+    entity: string;
+    cursorKey: string;
+    fields: string;
+    map: (r: any, ts: number) => CompetitorTradeRow;
 }
 
-async function pollTradesPage(): Promise<number> {
+// Each entity gets its OWN timestamp cursor. A shared cursor skips events:
+// when one stream is denser than another, advancing past the sparser
+// stream's page horizon drops everything in between.
+const ENTITIES: EntitySpec[] = [
+    {
+        entity: 'gatewayBuys', cursorKey: 'pollTs_buys',
+        fields: 'id timestamp_ marketProxy buyer outcomeIdx tokensIn sharesOut',
+        map: (b, ts) => ({
+            id: b.id, wallet: (b.buyer || '').toLowerCase(), market: (b.marketProxy || '').toLowerCase(),
+            side: 'buy', outcomeIdx: Number(b.outcomeIdx ?? -1),
+            tokens: Number(b.tokensIn || 0) / 1e6, shares: Number(b.sharesOut || 0) / 1e18, ts,
+        }),
+    },
+    {
+        entity: 'gatewaySells', cursorKey: 'pollTs_sells',
+        fields: 'id timestamp_ marketProxy seller outcomeIdx sharesIn tokensOut',
+        map: (s, ts) => ({
+            id: s.id, wallet: (s.seller || '').toLowerCase(), market: (s.marketProxy || '').toLowerCase(),
+            side: 'sell', outcomeIdx: Number(s.outcomeIdx ?? -1),
+            tokens: Number(s.tokensOut || 0) / 1e6, shares: Number(s.sharesIn || 0) / 1e18, ts,
+        }),
+    },
+    {
+        entity: 'gatewayRedemptions', cursorKey: 'pollTs_redeems',
+        fields: 'id timestamp_ marketProxy redeemer tokensOut',
+        map: (r, ts) => ({
+            id: r.id, wallet: (r.redeemer || '').toLowerCase(), market: (r.marketProxy || '').toLowerCase(),
+            side: 'redeem', outcomeIdx: -1, tokens: Number(r.tokensOut || 0) / 1e6, shares: 0, ts,
+        }),
+    },
+    {
+        entity: 'gatewayLiquidations', cursorKey: 'pollTs_liquidations',
+        fields: 'id timestamp_ marketProxy liquidator totalTokensOut',
+        map: (l, ts) => ({
+            id: l.id, wallet: (l.liquidator || '').toLowerCase(), market: (l.marketProxy || '').toLowerCase(),
+            side: 'liquidate', outcomeIdx: -1, tokens: Number(l.totalTokensOut || 0) / 1e6, shares: 0, ts,
+        }),
+    },
+];
+
+/** Pull all new events (every wallet) into competitor_trades. Each entity type
+ *  paginates independently, up to MAX_PAGES per loop. */
+export async function pollAllTrades(): Promise<number> {
+    const MAX_PAGES = 8;
     const subgraph = delphiClient.getSubgraph();
-    const sinceTs = Number(await getState('tradePollerLastTs')) || 0;
-    let stored = 0;
-    let maxTs = sinceTs;
+    let total = 0;
 
-    try {
-        const data = await subgraph.query<{ gatewayBuys: RawBuy[]; gatewaySells: RawSell[] }>(`
-            query Recent($since: BigInt!) {
-                gatewayBuys(first: ${POLL_PAGE}, orderBy: timestamp_, orderDirection: asc,
-                            where: { timestamp__gt: $since }) {
-                    id timestamp_ marketProxy buyer outcomeIdx tokensIn sharesOut
-                }
-                gatewaySells(first: ${POLL_PAGE}, orderBy: timestamp_, orderDirection: asc,
-                             where: { timestamp__gt: $since }) {
-                    id timestamp_ marketProxy seller outcomeIdx sharesIn tokensOut
-                }
-            }`, { since: String(sinceTs) });
-
-        const rows: CompetitorTradeRow[] = [];
-        for (const b of data.gatewayBuys || []) {
-            const ts = Number(b.timestamp_);
-            maxTs = Math.max(maxTs, ts);
-            rows.push({
-                id: b.id, wallet: (b.buyer || '').toLowerCase(), market: (b.marketProxy || '').toLowerCase(),
-                side: 'buy', outcomeIdx: Number(b.outcomeIdx ?? -1),
-                tokens: Number(b.tokensIn || 0) / 1e6, shares: Number(b.sharesOut || 0) / 1e18, ts,
-            });
-        }
-        for (const s of data.gatewaySells || []) {
-            const ts = Number(s.timestamp_);
-            maxTs = Math.max(maxTs, ts);
-            rows.push({
-                id: s.id, wallet: (s.seller || '').toLowerCase(), market: (s.marketProxy || '').toLowerCase(),
-                side: 'sell', outcomeIdx: Number(s.outcomeIdx ?? -1),
-                tokens: Number(s.tokensOut || 0) / 1e6, shares: Number(s.sharesIn || 0) / 1e18, ts,
-            });
-        }
-
-        // Redemptions & liquidations complete the realized-PnL picture.
-        // Queried separately: if field names differ on this subgraph the
-        // failure degrades to buys/sells-only standings instead of breaking.
+    for (const spec of ENTITIES) {
         try {
-            const exits = await subgraph.query<any>(`
-                query Exits($since: BigInt!) {
-                    gatewayRedemptions(first: ${POLL_PAGE}, orderBy: timestamp_, orderDirection: asc,
-                                       where: { timestamp__gt: $since }) {
-                        id timestamp_ marketProxy redeemer tokensOut
-                    }
-                    gatewayLiquidations(first: ${POLL_PAGE}, orderBy: timestamp_, orderDirection: asc,
-                                        where: { timestamp__gt: $since }) {
-                        id timestamp_ marketProxy liquidator totalTokensOut
-                    }
-                }`, { since: String(sinceTs) });
+            for (let page = 0; page < MAX_PAGES; page++) {
+                const sinceTs = Number(await getState(spec.cursorKey)) || 0;
+                const data = await subgraph.query<any>(`
+                    query P($since: BigInt!) {
+                        ${spec.entity}(first: ${POLL_PAGE}, orderBy: timestamp_, orderDirection: asc,
+                                       where: { timestamp__gt: $since }) { ${spec.fields} }
+                    }`, { since: String(sinceTs) });
 
-            for (const r of exits.gatewayRedemptions || []) {
-                const ts = Number(r.timestamp_);
-                maxTs = Math.max(maxTs, ts);
-                rows.push({
-                    id: r.id, wallet: (r.redeemer || '').toLowerCase(), market: (r.marketProxy || '').toLowerCase(),
-                    side: 'redeem', outcomeIdx: -1, tokens: Number(r.tokensOut || 0) / 1e6, shares: 0, ts,
+                const raw = data[spec.entity] || [];
+                if (raw.length === 0) break;
+
+                let maxTs = sinceTs;
+                const rows: CompetitorTradeRow[] = raw.map((r: any) => {
+                    const ts = Number(r.timestamp_);
+                    maxTs = Math.max(maxTs, ts);
+                    return spec.map(r, ts);
                 });
-            }
-            for (const l of exits.gatewayLiquidations || []) {
-                const ts = Number(l.timestamp_);
-                maxTs = Math.max(maxTs, ts);
-                rows.push({
-                    id: l.id, wallet: (l.liquidator || '').toLowerCase(), market: (l.marketProxy || '').toLowerCase(),
-                    side: 'liquidate', outcomeIdx: -1, tokens: Number(l.totalTokensOut || 0) / 1e6, shares: 0, ts,
-                });
+
+                total += await storeCompetitorTrades(rows);
+                await setState(spec.cursorKey, String(maxTs));
+                if (raw.length < POLL_PAGE) break; // caught up
             }
         } catch (e) {
-            console.warn('  [Context] Exit-event poll failed (standings will be flow-only):', (e as Error).message?.slice(0, 120));
+            console.warn(`  [Context] ${spec.entity} poll failed:`, (e as Error).message?.slice(0, 120));
         }
-
-        if (rows.length > 0) {
-            stored = await storeCompetitorTrades(rows);
-            await setState('tradePollerLastTs', String(maxTs));
-        }
-    } catch (e) {
-        console.warn('  [Context] Trade poller failed:', (e as Error).message?.slice(0, 150));
     }
-    return stored;
+    return total;
 }
 
 // ─── Per-market flow & crowding ──────────────────────────────────────────────

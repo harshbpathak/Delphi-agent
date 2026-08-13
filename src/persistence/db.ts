@@ -173,6 +173,18 @@ export async function recordSettlement(marketAddress: string, kind: 'redeem' | '
     );
 }
 
+/** Entry basis of an open position: total cost and shares bought (real trades). */
+export async function getOpenEntry(marketAddress: string, outcomeIdx: number): Promise<{ costTokens: number; shares: number } | null> {
+    const row = await db.get(
+        `SELECT SUM(cost_tokens) AS cost, SUM(shares) AS sh FROM trades
+         WHERE market_address = ? AND outcome_idx = ? AND dry_run = 0
+           AND market_address NOT IN (SELECT market_address FROM settlements)`,
+        [marketAddress, outcomeIdx]
+    );
+    if (!row || !row.sh) return null;
+    return { costTokens: row.cost, shares: row.sh };
+}
+
 /** Open (unsettled) real cost per category — for correlation/exposure caps. */
 export async function openCostByCategory(): Promise<Record<string, number>> {
     const rows = await db.all(

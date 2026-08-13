@@ -116,6 +116,15 @@ export async function recordSettlement(marketAddress, kind, proceedsTokens) {
     await db.run(`INSERT INTO settlements (market_address, kind, proceeds_tokens, cost_tokens, pnl_tokens, settled_at)
          VALUES (?, ?, ?, ?, ?, ?)`, [marketAddress, kind, proceedsTokens, cost, proceedsTokens - cost, Date.now()]);
 }
+/** Entry basis of an open position: total cost and shares bought (real trades). */
+export async function getOpenEntry(marketAddress, outcomeIdx) {
+    const row = await db.get(`SELECT SUM(cost_tokens) AS cost, SUM(shares) AS sh FROM trades
+         WHERE market_address = ? AND outcome_idx = ? AND dry_run = 0
+           AND market_address NOT IN (SELECT market_address FROM settlements)`, [marketAddress, outcomeIdx]);
+    if (!row || !row.sh)
+        return null;
+    return { costTokens: row.cost, shares: row.sh };
+}
 /** Open (unsettled) real cost per category — for correlation/exposure caps. */
 export async function openCostByCategory() {
     const rows = await db.all(`SELECT category, COALESCE(SUM(cost_tokens), 0) AS cost FROM trades

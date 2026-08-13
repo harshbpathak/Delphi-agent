@@ -152,17 +152,20 @@ async function sweepSettledPositions() {
     }
 }
 
-// ─── Exit Manager: pay yourself when the edge is exhausted ───────────────────
-const EXIT_EDGE_THRESHOLD = 0.01; // Sell when remaining net edge < 1% (fees make holding -EV vs redeploying)
+// ─── Exit Manager: take-profit / stop-loss / edge-exhausted ──────────────────
+const EXIT_EDGE_THRESHOLD = 0.01;  // Backstop: sell when remaining net edge < 1%
+const TAKE_PROFIT_PCT = 0.20;      // Harvest winners at +20% vs entry...
+const HOLD_EDGE_PCT = 0.10;        // ...unless the model still sees ≥10% edge (let monsters run)
+const STOP_LOSS_PCT = 0.30;        // Hard stop: cut any position down 30% from entry
 const SELL_SLIPPAGE_BPS = 200n;
 
 /**
- * For every open position on a still-open market: if the market price has
- * converged to (or moved past) our predicted probability, the remaining edge
- * is gone — sell, lock the profit/loss, and free the capital immediately
- * instead of waiting days for oracle settlement. This also exits reversals:
- * if a later evaluation moved our estimate below the price, remaining edge is
- * negative and the position is sold.
+ * Bracket-style exits on every open position, evaluated each loop:
+ *  1. STOP-LOSS   — mark ≤ entry × (1 − 30%): sell unconditionally.
+ *  2. TAKE-PROFIT — mark ≥ entry × (1 + 20%): sell and recycle the capital,
+ *     unless our current estimate still gives the position ≥10% net edge.
+ *  3. EDGE GONE   — remaining net edge < 1%: sell regardless of PnL
+ *     (converged winners and thesis reversals both land here).
  */
 async function exitExhaustedPositions(markets: EnrichedMarket[]) {
     let signer;
@@ -193,11 +196,26 @@ async function exitExhaustedPositions(markets: EnrichedMarket[]) {
             if (price === undefined) continue;
 
             const lastEval = await getLastEvaluation(market.address);
-            if (!lastEval) continue;
-            const pOut = idx === 0 ? lastEval.predicted_prob : 1 - lastEval.predicted_prob;
+            const pOut = lastEval ? (idx === 0 ? lastEval.predicted_prob : 1 - lastEval.predicted_prob) : null;
+            const remainingEdge = pOut !== null ? netEdge(pOut, price, market.tradingFee) : null;
 
-            const remainingEdge = netEdge(pOut, price, market.tradingFee);
-            if (remainingEdge >= EXIT_EDGE_THRESHOLD) continue; // still has edge — keep holding
+            // Entry basis from the journal (avg price actually paid).
+            const entry = await getOpenEntry(market.address, idx);
+            const entryPrice = entry && entry.shares > 0 ? entry.costTokens / entry.shares : null;
+            const gainPct = entryPrice ? price / entryPrice - 1 : null;
+
+            let reason: string | null = null;
+            if (gainPct !== null && gainPct <= -STOP_LOSS_PCT) {
+                reason = `STOP-LOSS (${(gainPct * 100).toFixed(1)}% vs entry ${entryPrice!.toFixed(3)})`;
+            } else if (remainingEdge !== null && remainingEdge < EXIT_EDGE_THRESHOLD) {
+                reason = `edge exhausted (${(remainingEdge * 100).toFixed(1)}%)`;
+            } else if (
+                gainPct !== null && gainPct >= TAKE_PROFIT_PCT &&
+                (remainingEdge === null || remainingEdge < HOLD_EDGE_PCT)
+            ) {
+                reason = `TAKE-PROFIT (+${(gainPct * 100).toFixed(1)}% vs entry ${entryPrice!.toFixed(3)})`;
+            }
+            if (!reason) continue; // keep holding
 
             // Quote the exit and sanity-check sell-side slippage.
             const { tokensOut } = await delphiClient.quoteSell({
@@ -214,7 +232,7 @@ async function exitExhaustedPositions(markets: EnrichedMarket[]) {
 
             const minTokensOut = tokensOut * (10_000n - SELL_SLIPPAGE_BPS) / 10_000n;
 
-            console.log(`💸 Exiting "${market.question.slice(0, 60)}" — ${sharesNum.toFixed(2)} × "${market.outcomes[idx]}" @ ~${sellEffPrice.toFixed(3)} (${proceeds.toFixed(2)} TST). Remaining edge ${(remainingEdge * 100).toFixed(2)}% < ${(EXIT_EDGE_THRESHOLD * 100).toFixed(0)}%.`);
+            console.log(`💸 Exiting "${market.question.slice(0, 60)}" — ${sharesNum.toFixed(2)} × "${market.outcomes[idx]}" @ ~${sellEffPrice.toFixed(3)} (${proceeds.toFixed(2)} TST). Reason: ${reason}.`);
 
             if (!DRY_RUN) {
                 await delphiClient.sellShares({
@@ -226,8 +244,8 @@ async function exitExhaustedPositions(markets: EnrichedMarket[]) {
             }
 
             await recordSettlement(pos.marketProxy, 'sell', proceeds);
-            logEvent('SELL', `${sharesNum.toFixed(2)} "${market.outcomes[idx]}" @ ${sellEffPrice.toFixed(3)} → +${proceeds.toFixed(2)} TST — edge exhausted (${(remainingEdge * 100).toFixed(1)}%) — "${market.question.slice(0, 60)}"${DRY_RUN ? ' [DRY]' : ''}`);
-            await notify(`💸 *SOLD* ${sharesNum.toFixed(1)} × "${market.outcomes[idx]}" for *${proceeds.toFixed(2)} TST*\n_${market.question.slice(0, 90)}_\nEdge exhausted — capital freed for redeployment.`);
+            logEvent('SELL', `${sharesNum.toFixed(2)} "${market.outcomes[idx]}" @ ${sellEffPrice.toFixed(3)} → +${proceeds.toFixed(2)} TST — ${reason} — "${market.question.slice(0, 60)}"${DRY_RUN ? ' [DRY]' : ''}`);
+            await notify(`💸 *SOLD* ${sharesNum.toFixed(1)} × "${market.outcomes[idx]}" for *${proceeds.toFixed(2)} TST*\n_${market.question.slice(0, 90)}_\n${reason} — capital freed for redeployment.`);
         } catch (e) {
             console.error(`  Exit check failed for ${pos.marketProxy}:`, (e as Error).message?.slice(0, 150));
         }

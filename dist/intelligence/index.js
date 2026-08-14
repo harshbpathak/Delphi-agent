@@ -1,6 +1,7 @@
 import { getGeminiProbability } from './geminiOracle.js';
 import { getPythonProbability } from './pythonOracle.js';
 import { applyMarketConsensus } from './marketConsensus.js';
+import { getLearnedWeights } from '../maintenance/selfCalibrate.js';
 // Gemini (evidence + search + resolution-criteria reasoning) dominates.
 // The Python service contributes a small on-chain flow signal at most —
 // its features (buy pressure, momentum, headline sentiment) are weak
@@ -59,6 +60,10 @@ export async function getCombinedProbability(market, articles, callGemini, flow 
         const t = Date.parse(iso);
         return isNaN(t) ? null : (t - Date.now()) / 3600_000;
     })();
+    const learned = await getLearnedWeights();
+    const learnedBaseWeight = learned
+        ? (learned.byCategory[market.category] ?? learned.global)
+        : null;
     const consensus = applyMarketConsensus({
         rawProb,
         marketProb: currentImpliedProb,
@@ -68,6 +73,7 @@ export async function getCombinedProbability(market, articles, callGemini, flow 
         eventConcluded: geminiResult.eventConcluded,
         ambiguity: geminiResult.ambiguity,
         hasJustification: geminiResult.deviationJustification !== null,
+        learnedBaseWeight,
     });
     if (Math.abs(consensus.probability - rawProb) > 0.005) {
         console.log(`  [Consensus] ${consensus.note}`);

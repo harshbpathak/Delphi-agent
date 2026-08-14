@@ -71,6 +71,15 @@ export async function initDatabase() {
             settled_at INTEGER
         );
     `);
+
+    // Additive migrations for self-calibration (ALTER fails harmlessly if the
+    // column already exists).
+    for (const ddl of [
+        `ALTER TABLE market_evaluations ADD COLUMN raw_prob REAL`,
+        `ALTER TABLE market_evaluations ADD COLUMN category TEXT`,
+    ]) {
+        try { await db.exec(ddl); } catch { /* column exists */ }
+    }
 }
 
 // ─── Article dedup ───────────────────────────────────────────────────────────
@@ -114,16 +123,32 @@ export async function getLastEvaluation(marketAddress: string): Promise<MarketEv
     return row || null;
 }
 
-export async function saveEvaluation(marketAddress: string, predictedProb: number, marketPrice: number) {
+export async function saveEvaluation(
+    marketAddress: string, predictedProb: number, marketPrice: number,
+    rawProb: number | null = null, category: string | null = null
+) {
     await db.run(
-        `INSERT INTO market_evaluations (market_address, predicted_prob, market_price, evaluated_at)
-         VALUES (?, ?, ?, ?)
+        `INSERT INTO market_evaluations (market_address, predicted_prob, market_price, evaluated_at, raw_prob, category)
+         VALUES (?, ?, ?, ?, ?, ?)
          ON CONFLICT(market_address) DO UPDATE SET
             predicted_prob = excluded.predicted_prob,
             market_price = excluded.market_price,
-            evaluated_at = excluded.evaluated_at`,
-        [marketAddress, predictedProb, marketPrice, Date.now()]
+            evaluated_at = excluded.evaluated_at,
+            raw_prob = excluded.raw_prob,
+            category = excluded.category`,
+        [marketAddress, predictedProb, marketPrice, Date.now(), rawProb, category]
     );
+}
+
+/** All evaluations that captured a raw (pre-dampening) probability — the
+ *  training rows for consensus-weight self-calibration. */
+export async function listCalibrationRows(): Promise<Array<{
+    market_address: string; raw_prob: number; market_price: number; category: string | null;
+}>> {
+    return db.all(
+        `SELECT market_address, raw_prob, market_price, category
+         FROM market_evaluations WHERE raw_prob IS NOT NULL`
+    ) as any;
 }
 
 // ─── Trade journal ───────────────────────────────────────────────────────────

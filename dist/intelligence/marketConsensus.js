@@ -29,13 +29,15 @@ const EPS = 1e-4;
 const logit = (p) => Math.log(clamp(p, EPS, 1 - EPS) / (1 - clamp(p, EPS, 1 - EPS)));
 const invLogit = (x) => 1 / (1 + Math.exp(-x));
 export function applyMarketConsensus(input) {
-    const { rawProb, marketProb, hoursToResolve, trades24h, uniqueWallets24h, eventConcluded, ambiguity, hasJustification } = input;
+    const { rawProb, marketProb, hoursToResolve, trades24h, uniqueWallets24h, eventConcluded, ambiguity, hasJustification, learnedBaseWeight } = input;
     // The narrow licence to override the crowd: settled facts AND clean rules
     // AND a named reason. Ambiguous criteria void it — that is precisely the
     // case where being right about the facts does not make us right about the
     // outcome.
     const verifiedFact = eventConcluded && ambiguity === 'none' && hasJustification;
-    let w = 0.12; // always give the aggregate some respect
+    // Base respect for the aggregate: learned from settled outcomes when
+    // available (clamped to sane bounds), hand-tuned 0.12 until then.
+    let w = learnedBaseWeight != null ? clamp(learnedBaseWeight, 0.05, 0.60) : 0.12;
     // 1. Size of disagreement
     const disagreement = Math.abs(rawProb - marketProb);
     if (disagreement > 0.50)

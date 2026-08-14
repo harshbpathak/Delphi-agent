@@ -7,6 +7,7 @@ import { getCombinedProbability } from './intelligence/index.js';
 import { calculatePositionSize, netEdge, DEFAULT_GUARDRAILS } from './risk/kellyCalculator.js';
 import { postureAdjustedGuardrails } from './risk/riskPosture.js';
 import { pollAllTrades, getMarketFlow, getCompetitionPosture } from './intelligence/marketContext.js';
+import { selfCalibrate } from './maintenance/selfCalibrate.js';
 import { logEvent } from './observability/eventLog.js';
 import { startTelegram, notify } from './observability/telegram.js';
 import { startDashboard } from './observability/dashboard.js';
@@ -504,7 +505,7 @@ async function evaluateMarkets(markets, guardrails) {
         consecutiveGeminiFailures = 0;
         await commitArticles(articles);
         const currentImpliedProb = market.impliedProbabilities[0];
-        await saveEvaluation(market.address, prediction.probability, currentImpliedProb);
+        await saveEvaluation(market.address, prediction.probability, currentImpliedProb, prediction.rawProb, market.category);
         const grossEdge = prediction.probability - currentImpliedProb;
         const outcomeIdx = grossEdge > 0 ? 0 : 1;
         const effectiveProb = outcomeIdx === 0 ? prediction.probability : 1 - prediction.probability;
@@ -660,6 +661,13 @@ async function runLoop() {
     console.log(`🔄 Trading Loop Started — ${new Date().toISOString()}${DRY_RUN ? ' [DRY RUN]' : ''}`);
     console.log(`${'═'.repeat(70)}`);
     await checkAndResetDailyQuotas();
+    // 0b. Self-calibration: refit consensus weights from settled outcomes
+    //     every ~6h (cheap; no-ops until enough markets have settled).
+    const lastCal = Number(await getState('lastCalibrationTs')) || 0;
+    if (Date.now() - lastCal > 6 * 3600_000) {
+        await selfCalibrate();
+        await setState('lastCalibrationTs', String(Date.now()));
+    }
     // 1. Sweep first — frees settled capital before sizing new trades, and
     //    keeps the realized-PnL journal current for the circuit breaker.
     await sweepSettledPositions();

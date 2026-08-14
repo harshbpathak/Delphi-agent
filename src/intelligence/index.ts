@@ -3,6 +3,7 @@ import { getPythonProbability } from './pythonOracle.js';
 import { EnrichedMarket } from '../execution/marketScanner.js';
 import { ScrapedArticle } from '../ingestion/rssScraper.js';
 import { applyMarketConsensus } from './marketConsensus.js';
+import { getLearnedWeights } from '../maintenance/selfCalibrate.js';
 
 export interface CombinedPrediction {
     /** Final probability that OUTCOME 0 wins, after market-consensus dampening */
@@ -106,6 +107,11 @@ export async function getCombinedProbability(
         return isNaN(t) ? null : (t - Date.now()) / 3600_000;
     })();
 
+    const learned = await getLearnedWeights();
+    const learnedBaseWeight = learned
+        ? (learned.byCategory[market.category] ?? learned.global)
+        : null;
+
     const consensus = applyMarketConsensus({
         rawProb,
         marketProb: currentImpliedProb,
@@ -115,6 +121,7 @@ export async function getCombinedProbability(
         eventConcluded: geminiResult.eventConcluded,
         ambiguity: geminiResult.ambiguity,
         hasJustification: geminiResult.deviationJustification !== null,
+        learnedBaseWeight,
     });
 
     if (Math.abs(consensus.probability - rawProb) > 0.005) {

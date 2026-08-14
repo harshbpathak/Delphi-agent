@@ -720,19 +720,47 @@ async function getHoldings() {
         });
         if (!positions)
             return [];
-        return positions.map(pos => {
-            const m = lastMarkets.find(mk => mk.address.toLowerCase() === pos.marketProxy.toLowerCase());
+        const out = [];
+        for (const pos of positions) {
             const idx = Number(pos.outcomeIdx);
             const shares = Number(pos.shares) / 1e18;
-            const price = m?.spotPrices[idx];
-            return {
+            // Open markets come from the scan cache; positions whose market has
+            // CLOSED for trading (awaiting_settlement/settled) are not in the
+            // scan, so fetch them directly — otherwise they'd show as mark 0.
+            let m = lastMarkets.find(mk => mk.address.toLowerCase() === pos.marketProxy.toLowerCase());
+            let question = m?.question;
+            let outcomes = m?.outcomes;
+            let price = m?.spotPrices[idx];
+            let status = m ? 'open' : pos.marketStatus;
+            if (!m) {
+                try {
+                    const full = await delphiClient.getMarket({
+                        id: pos.marketProxy,
+                        pricesAndImpliedProbabilities: true,
+                    });
+                    question = full.metadata?.question ?? question;
+                    outcomes = full.metadata?.outcomes ?? outcomes;
+                    status = full.status;
+                    if (full.status === 'settled' && full.winningOutcomeIdx !== null) {
+                        // Settled: a share is worth exactly 1 if it won, 0 if it lost.
+                        price = Number(full.winningOutcomeIdx) === idx ? 1 : 0;
+                    }
+                    else {
+                        price = full.spotPrices?.[idx];
+                    }
+                }
+                catch { /* market unreachable — leave fallbacks */ }
+            }
+            out.push({
                 market: pos.marketProxy,
-                question: m?.question || pos.marketProxy,
-                outcome: m?.outcomes[idx] || `outcome ${idx}`,
+                question: question || pos.marketProxy,
+                outcome: outcomes?.[idx] || `outcome ${idx}`,
                 shares,
                 mark: price !== undefined ? shares * price : 0,
-            };
-        });
+                status,
+            });
+        }
+        return out;
     }
     catch {
         return [];
@@ -753,8 +781,11 @@ async function holdingsText() {
     if (h.length === 0)
         return 'No open positions.';
     const total = h.reduce((s, p) => s + p.mark, 0);
+    const statusTag = (s) => s === 'open' ? '' :
+        s === 'awaiting_settlement' ? ' ⏳ awaiting settlement' :
+            s === 'settled' ? ' 🏁 settled' : ` (${s})`;
     return `📊 Holdings (mark ${total.toFixed(2)} TST)\n\n` +
-        h.map(p => `• ${p.shares.toFixed(1)} × "${p.outcome}" ≈ ${p.mark.toFixed(2)} TST\n  ${p.question.slice(0, 70)}`).join('\n');
+        h.map(p => `• ${p.shares.toFixed(1)} × "${p.outcome}" ≈ ${p.mark.toFixed(2)} TST${statusTag(p.status)}\n  ${p.question.slice(0, 70)}`).join('\n');
 }
 // ─── Entry Point ─────────────────────────────────────────────────────────────
 async function main() {

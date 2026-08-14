@@ -115,6 +115,7 @@ class DriftModel:
         self.sd = None
         self.n_train = 0
         self.acc = 0.0
+        self.ybar = 0.5  # training base rate of "price rises" — drift is measured RELATIVE to this
         self.lock = threading.Lock()
 
     def fit(self):
@@ -135,6 +136,7 @@ class DriftModel:
         base = float(max(y.mean(), 1 - y.mean()))
         with self.lock:
             self.w, self.mu, self.sd, self.n_train, self.acc = w, mu, sd, len(y), acc
+            self.ybar = float(y.mean())
         logger.info(f"Drift model fitted: {len(y)} samples from {sum(1 for f in markets.values() if len(f) >= MIN_FILLS)} markets | train acc {acc:.3f} (majority baseline {base:.3f})")
 
     def predict_up(self, feats):
@@ -199,7 +201,11 @@ def predict_probability(req: PredictionRequest):
     if len(fills) >= WINDOW:
         p_up = MODEL.predict_up(features_at(fills, len(fills)))
         if p_up is not None:
-            drift = 2 * p_up - 1                       # [-1, 1]
+            # Drift relative to the training base rate: p_up == ybar means
+            # "nothing unusual", not "price will fall". Without this centering
+            # the class imbalance (~86% no-rise) would bias every market down.
+            denom = max(MODEL.ybar, 1 - MODEL.ybar, 1e-6)
+            drift = float(np.clip((p_up - MODEL.ybar) / denom, -1, 1))
             recent = [f for f in fills if f[0] > time.time() - 86400]
             activity = min(len(recent) / 50.0, 1.0)
             prob = float(np.clip(anchor + MAX_ADJ * drift * activity, 0.02, 0.98))

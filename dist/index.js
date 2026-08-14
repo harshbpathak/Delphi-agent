@@ -1,6 +1,6 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
-import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, getOpenEntry, performanceStats, settlementExists, getOpenCost, } from './persistence/db.js';
+import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, getOpenEntry, performanceStats, settlementExists, getOpenCost, recordPriceSnapshots, } from './persistence/db.js';
 import { scanOpenMarkets } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles } from './ingestion/rssScraper.js';
 import { getCombinedProbability } from './intelligence/index.js';
@@ -691,6 +691,19 @@ async function runLoop() {
     //     fetched right after.
     const markets = await scanOpenMarkets();
     lastMarkets = markets;
+    // Price-history recorder: one snapshot per market per loop. This is the
+    // dataset future models (volatility, drift labels, longshot-bias curve)
+    // train on — collected whether or not we trade.
+    try {
+        await recordPriceSnapshots(markets.map(m => ({
+            market: m.address,
+            p0: m.impliedProbabilities[0],
+            p1: m.impliedProbabilities[1] ?? null,
+        })));
+    }
+    catch (e) {
+        console.warn('  Price snapshot failed:', e.message?.slice(0, 100));
+    }
     await exitExhaustedPositions(markets);
     // 2. Bankroll
     let bankroll = 0;

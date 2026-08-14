@@ -68,6 +68,15 @@ export async function initDatabase() {
             settled_at INTEGER
         );
     `);
+    await db.exec(`
+        CREATE TABLE IF NOT EXISTS price_snapshots (
+            market TEXT NOT NULL,
+            p0 REAL NOT NULL,
+            p1 REAL,
+            ts INTEGER NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS idx_ps_market_ts ON price_snapshots(market, ts);
+    `);
     // Additive migrations for self-calibration (ALTER fails harmlessly if the
     // column already exists).
     for (const ddl of [
@@ -165,6 +174,15 @@ export async function recentSettledPnl(lastN) {
     const rows = await db.all(`SELECT pnl_tokens FROM settlements ORDER BY settled_at DESC LIMIT ?`, [lastN]);
     const netPnl = rows.reduce((s, r) => s + (r.pnl_tokens || 0), 0);
     return { count: rows.length, netPnl };
+}
+// ─── Price history ───────────────────────────────────────────────────────────
+/** One row per open market per loop: the clean price time-series that every
+ *  future model (volatility, drift, bias curve) trains on. */
+export async function recordPriceSnapshots(rows) {
+    const ts = Date.now();
+    for (const r of rows) {
+        await db.run(`INSERT INTO price_snapshots (market, p0, p1, ts) VALUES (?, ?, ?, ?)`, [r.market.toLowerCase(), r.p0, r.p1, ts]);
+    }
 }
 export async function storeCompetitorTrades(rows) {
     let stored = 0;

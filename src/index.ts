@@ -6,7 +6,7 @@ import {
     getLastEvaluation, saveEvaluation,
     recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot,
     openCostByCategory, getOpenEntry, performanceStats,
-    settlementExists, getOpenCost,
+    settlementExists, getOpenCost, recordPriceSnapshots,
 } from './persistence/db.js';
 import { scanOpenMarkets, EnrichedMarket } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles, ScrapedArticle } from './ingestion/rssScraper.js';
@@ -776,6 +776,20 @@ async function runLoop() {
     //     fetched right after.
     const markets = await scanOpenMarkets();
     lastMarkets = markets;
+
+    // Price-history recorder: one snapshot per market per loop. This is the
+    // dataset future models (volatility, drift labels, longshot-bias curve)
+    // train on — collected whether or not we trade.
+    try {
+        await recordPriceSnapshots(markets.map(m => ({
+            market: m.address,
+            p0: m.impliedProbabilities[0]!,
+            p1: m.impliedProbabilities[1] ?? null,
+        })));
+    } catch (e) {
+        console.warn('  Price snapshot failed:', (e as Error).message?.slice(0, 100));
+    }
+
     await exitExhaustedPositions(markets);
 
     // 2. Bankroll

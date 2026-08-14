@@ -64,15 +64,33 @@ async function persistCounters() {
     await setState('lastResetTimestamp', String(lastResetTimestamp));
 }
 
+/** Start of the current Gemini free-tier quota day: midnight Pacific (07:00 UTC
+ *  during PDT). Aligning our counters to Google's window means we never sit
+ *  blocked on a stale local counter while the provider quota is actually fresh. */
+function currentQuotaWindowStart(): number {
+    const start = new Date();
+    start.setUTCHours(7, 0, 0, 0);
+    if (start.getTime() > Date.now()) start.setUTCDate(start.getUTCDate() - 1);
+    return start.getTime();
+}
+
 async function checkAndResetDailyQuotas() {
-    const elapsedHours = (Date.now() - lastResetTimestamp) / 3600_000;
-    if (elapsedHours >= 24) {
-        console.log(`\n🕒 24 hours elapsed. Resetting daily counters (Previous trades: ${dailyTradeCount}, Gemini calls: ${dailyGeminiCallCount}).`);
+    const windowStart = currentQuotaWindowStart();
+    if (lastResetTimestamp < windowStart) {
+        console.log(`\n🕒 New quota day (07:00 UTC). Resetting daily counters (Previous trades: ${dailyTradeCount}, Gemini calls: ${dailyGeminiCallCount}).`);
         dailyTradeCount = 0;
         dailyGeminiCallCount = 0;
-        lastResetTimestamp = Date.now();
+        lastResetTimestamp = windowStart;
         await persistCounters();
     }
+}
+
+/** Paced Gemini budget: the daily allowance is released smoothly over the
+ *  24h window (plus a 20-call burst headroom) so one busy morning can't
+ *  leave the agent evaluation-blind all evening. */
+function pacedGeminiBudget(): number {
+    const hoursIn = Math.max(0, (Date.now() - lastResetTimestamp) / 3600_000);
+    return Math.min(MAX_DAILY_GEMINI_CALLS, Math.ceil(MAX_DAILY_GEMINI_CALLS * hoursIn / 24) + 20);
 }
 
 // ─── Keyword Extraction (supplemental RSS context for Gemini) ────────────────
@@ -474,8 +492,9 @@ async function evaluateMarkets(markets: EnrichedMarket[], guardrails: RiskGuardr
             continue;
         }
 
-        if (dailyGeminiCallCount >= MAX_DAILY_GEMINI_CALLS) {
-            console.warn(`⚠️  Daily Gemini budget exhausted (${MAX_DAILY_GEMINI_CALLS}). Deferring remaining evaluations to tomorrow.`);
+        const budget = pacedGeminiBudget();
+        if (dailyGeminiCallCount >= budget) {
+            console.warn(`⚠️  Paced Gemini budget reached (${dailyGeminiCallCount}/${budget} released of ${MAX_DAILY_GEMINI_CALLS}/day). Deferring remaining evaluations.`);
             break;
         }
 

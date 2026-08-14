@@ -682,9 +682,24 @@ async function executeCandidate(c: TradeCandidate, bankroll: number, guardrails:
         effectivePrice = tokensFromBigint(tokensIn) / sharesFromBigint(sharesOut);
     }
 
-    const maxTokensIn = tokensIn * (10_000n + MAX_SLIPPAGE_BPS) / 10_000n;
-    const costHuman = tokensFromBigint(tokensIn);
-    const maxCostHuman = tokensFromBigint(maxTokensIn);
+    let maxTokensIn = tokensIn * (10_000n + MAX_SLIPPAGE_BPS) / 10_000n;
+    let costHuman = tokensFromBigint(tokensIn);
+    let maxCostHuman = tokensFromBigint(maxTokensIn);
+
+    // If the quote lands slightly OVER the hard cap, trim the order to fit
+    // instead of abandoning the trade — a 2% size haircut beats a 100% one.
+    const capSpend = bankroll * guardrails.maxSingleBetPct * (1 + Number(MAX_SLIPPAGE_BPS) / 10_000);
+    if (maxCostHuman > capSpend && maxCostHuman <= capSpend * 1.15) {
+        const scale = (capSpend / maxCostHuman) * 0.99;
+        sharesOut = sharesOut * BigInt(Math.round(scale * 1e6)) / 1_000_000n;
+        const requote = await getSlippageQuote(market.address as `0x${string}`, outcomeIdx, sharesOut);
+        if (!requote) return 0;
+        tokensIn = requote;
+        effectivePrice = tokensFromBigint(tokensIn) / sharesFromBigint(sharesOut);
+        maxTokensIn = tokensIn * (10_000n + MAX_SLIPPAGE_BPS) / 10_000n;
+        costHuman = tokensFromBigint(tokensIn);
+        maxCostHuman = tokensFromBigint(maxTokensIn);
+    }
 
     // DON'T churn: expected profit must clear the fee hurdle by a real margin.
     const expectedProfit = edgeAfterSlippage * sharesFromBigint(sharesOut);

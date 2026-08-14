@@ -73,21 +73,21 @@ async function main() {
     }
 
     // ── 2. Repair settlement PnL ─────────────────────────────────────────
-    // Cost basis = our on-chain buys on that market that happened BEFORE the
-    // exit. Sells before the exit are netted out so partial exits aren't
-    // double-counted as cost.
+    // Cost basis = everything we SPENT on that market up to the exit. Sells
+    // must NOT be netted out here: the exit sale is itself recorded as the
+    // settlement's proceeds, so subtracting it would zero the cost and report
+    // the entire sale as profit.
     const settlements = await db.all(`SELECT id, market_address, proceeds_tokens, cost_tokens, settled_at FROM settlements`);
     let repaired = 0;
     for (const s of settlements as any[]) {
         const tsCut = Math.floor(s.settled_at / 1000);
         const agg = await db.get(
-            `SELECT COALESCE(SUM(CASE WHEN side='buy' THEN tokens ELSE 0 END),0) AS bought,
-                    COALESCE(SUM(CASE WHEN side='sell' THEN tokens ELSE 0 END),0) AS sold
+            `SELECT COALESCE(SUM(tokens),0) AS bought
              FROM competitor_trades
-             WHERE wallet = ? AND market = ? AND ts <= ?`,
+             WHERE wallet = ? AND market = ? AND side = 'buy' AND ts <= ?`,
             [us, s.market_address.toLowerCase(), tsCut]
         );
-        const trueCost = Math.max(0, (agg?.bought || 0) - (agg?.sold || 0));
+        const trueCost = agg?.bought || 0;
         if (Math.abs(trueCost - s.cost_tokens) <= EPS) continue;
 
         const pnl = s.proceeds_tokens - trueCost;

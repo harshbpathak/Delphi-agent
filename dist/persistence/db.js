@@ -136,7 +136,7 @@ export async function recordTrade(t) {
 export async function getOpenCost(marketAddress) {
     const row = await db.get(`SELECT COALESCE(SUM(cost_tokens), 0) AS cost FROM trades
          WHERE market_address = ? AND dry_run = 0
-           AND market_address NOT IN (SELECT market_address FROM settlements)`, [marketAddress]);
+           AND created_at > COALESCE((SELECT MAX(s.settled_at) FROM settlements s WHERE s.market_address = trades.market_address), 0)`, [marketAddress]);
     return row?.cost || 0;
 }
 /** True once a market has been closed out in the journal (redeem/liquidate/sell/loss). */
@@ -153,7 +153,7 @@ export async function recordSettlement(marketAddress, kind, proceedsTokens) {
 export async function getOpenEntry(marketAddress, outcomeIdx) {
     const row = await db.get(`SELECT SUM(cost_tokens) AS cost, SUM(shares) AS sh FROM trades
          WHERE market_address = ? AND outcome_idx = ? AND dry_run = 0
-           AND market_address NOT IN (SELECT market_address FROM settlements)`, [marketAddress, outcomeIdx]);
+           AND created_at > COALESCE((SELECT MAX(s.settled_at) FROM settlements s WHERE s.market_address = trades.market_address), 0)`, [marketAddress, outcomeIdx]);
     if (!row || !row.sh)
         return null;
     return { costTokens: row.cost, shares: row.sh };
@@ -162,7 +162,7 @@ export async function getOpenEntry(marketAddress, outcomeIdx) {
 export async function openCostByCategory() {
     const rows = await db.all(`SELECT category, COALESCE(SUM(cost_tokens), 0) AS cost FROM trades
          WHERE dry_run = 0
-           AND market_address NOT IN (SELECT market_address FROM settlements)
+           AND created_at > COALESCE((SELECT MAX(s.settled_at) FROM settlements s WHERE s.market_address = trades.market_address), 0)
          GROUP BY category`);
     const out = {};
     for (const r of rows)

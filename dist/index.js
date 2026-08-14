@@ -1,6 +1,6 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
-import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, getOpenEntry, performanceStats, settlementExists, getOpenCost, recordPriceSnapshots, } from './persistence/db.js';
+import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, getOpenEntry, performanceStats, getOpenCost, recordPriceSnapshots, } from './persistence/db.js';
 import { scanOpenMarkets } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles } from './ingestion/rssScraper.js';
 import { getCombinedProbability } from './intelligence/index.js';
@@ -133,9 +133,9 @@ async function sweepSettledPositions() {
                     }
                     catch { /* unknown winner → fall through and attempt redeem */ }
                     if (winningIdx !== null && Number(pos.outcomeIdx) !== winningIdx) {
-                        if (await settlementExists(pos.marketProxy))
-                            continue; // already journalled
                         const lostCost = await getOpenCost(pos.marketProxy);
+                        if (lostCost <= 0.01)
+                            continue; // already journalled (or nothing at risk)
                         await recordSettlement(pos.marketProxy, 'loss', 0);
                         const shares = Number(pos.shares) / 1e18;
                         console.log(`  ❌ Lost market ${pos.marketProxy}: ${shares.toFixed(2)} shares of outcome ${pos.outcomeIdx} expired worthless (winner was ${winningIdx}). Cost ${lostCost.toFixed(2)} TST written off.`);

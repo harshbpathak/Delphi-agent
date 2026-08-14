@@ -193,7 +193,7 @@ export async function getOpenCost(marketAddress: string): Promise<number> {
     const row = await db.get(
         `SELECT COALESCE(SUM(cost_tokens), 0) AS cost FROM trades
          WHERE market_address = ? AND dry_run = 0
-           AND market_address NOT IN (SELECT market_address FROM settlements)`,
+           AND created_at > COALESCE((SELECT MAX(s.settled_at) FROM settlements s WHERE s.market_address = trades.market_address), 0)`,
         [marketAddress]
     );
     return row?.cost || 0;
@@ -219,7 +219,7 @@ export async function getOpenEntry(marketAddress: string, outcomeIdx: number): P
     const row = await db.get(
         `SELECT SUM(cost_tokens) AS cost, SUM(shares) AS sh FROM trades
          WHERE market_address = ? AND outcome_idx = ? AND dry_run = 0
-           AND market_address NOT IN (SELECT market_address FROM settlements)`,
+           AND created_at > COALESCE((SELECT MAX(s.settled_at) FROM settlements s WHERE s.market_address = trades.market_address), 0)`,
         [marketAddress, outcomeIdx]
     );
     if (!row || !row.sh) return null;
@@ -231,7 +231,7 @@ export async function openCostByCategory(): Promise<Record<string, number>> {
     const rows = await db.all(
         `SELECT category, COALESCE(SUM(cost_tokens), 0) AS cost FROM trades
          WHERE dry_run = 0
-           AND market_address NOT IN (SELECT market_address FROM settlements)
+           AND created_at > COALESCE((SELECT MAX(s.settled_at) FROM settlements s WHERE s.market_address = trades.market_address), 0)
          GROUP BY category`
     );
     const out: Record<string, number> = {};

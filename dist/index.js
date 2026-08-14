@@ -8,7 +8,7 @@ import { calculatePositionSize, netEdge, DEFAULT_GUARDRAILS } from './risk/kelly
 import { postureAdjustedGuardrails } from './risk/riskPosture.js';
 import { pollAllTrades, getMarketFlow, getCompetitionPosture } from './intelligence/marketContext.js';
 import { selfCalibrate } from './maintenance/selfCalibrate.js';
-import { runDataWatchers } from './maintenance/dataWatchers.js';
+import { runDataWatchers, heldMarketsNeedingRecheck, RECHECK_HOURS } from './maintenance/dataWatchers.js';
 import { logEvent } from './observability/eventLog.js';
 import { startTelegram, notify } from './observability/telegram.js';
 import { startDashboard } from './observability/dashboard.js';
@@ -412,6 +412,13 @@ async function shouldEvaluate(market, articles) {
     if (hrs !== null && hrs * 3600_000 < NEAR_SETTLE_REEVAL_MS
         && Date.now() - lastEval.evaluated_at > NEAR_SETTLE_REEVAL_INTERVAL_MS) {
         return `settles in ${hrs.toFixed(1)}h — periodic re-check`;
+    }
+    // HELD markets with no hard-data watcher (e.g. official-record questions)
+    // get a forced Gemini+search re-check on a fixed cadence — our money is
+    // on the line, so its thesis is never allowed to go stale.
+    if (heldMarketsNeedingRecheck.has(market.address.toLowerCase())
+        && Date.now() - lastEval.evaluated_at > RECHECK_HOURS * 3600_000) {
+        return `held position — ${RECHECK_HOURS}h monitoring re-check`;
     }
     return null;
 }

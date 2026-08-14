@@ -1,104 +1,179 @@
 /**
- * Hard-data watchers: markets whose outcome is a measurable physical quantity
- * get monitored against the PRIMARY data source directly — no LLM, no news.
+ * Hard-data watchers for every REAL-WORLD holding, on a polling basis.
  *
- * Each watcher fetches the gauge, projects the value at the deadline from the
- * recent trend, converts it to a probability, and writes it into
- * market_evaluations. The exit manager reads those evaluations every loop, so
- * a deteriorating projection automatically tightens into a sell with zero
- * human latency.
+ * Each loop, every open position's market is matched against known
+ * primary-data patterns (auto-detected from the question/criteria text — no
+ * per-market configuration):
+ *
+ *   - USGS gauge questions   → poll the USGS Water Services API hourly,
+ *                              project the reading at the deadline from the
+ *                              recent trend.
+ *   - CoinGecko close        → poll the CoinGecko price API hourly, convert
+ *     questions                distance-to-threshold into a probability via a
+ *                              lognormal volatility model.
+ *   - everything else        → flagged for a forced Gemini+search re-check
+ *                              every RECHECK_HOURS (the primary source needs
+ *                              reading, not an API).
+ *
+ * Watcher output is written into market_evaluations — the same store the
+ * exit manager reads — so deteriorating data tightens into an automatic sell
+ * with zero human latency.
  */
-import { saveEvaluation } from '../persistence/db.js';
-import { getState, setState } from '../persistence/db.js';
+import { delphiClient } from '../execution/delphiClient.js';
+import { saveEvaluation, getState, setState } from '../persistence/db.js';
 import { logEvent } from '../observability/eventLog.js';
 import { EnrichedMarket } from '../execution/marketScanner.js';
 
-interface UsgsWatch {
-    marketAddress: string;
-    usgsSite: string;
-    /** Threshold in the question */
-    threshold: number;
-    /** Outcome 0 wins when the measured value is BELOW the threshold */
-    outcome0IsBelow: boolean;
-    deadlineIso: string;
-    /** Forecast noise (std dev) at the deadline horizon, in measurement units */
-    sigma: number;
-    label: string;
+const CHECK_INTERVAL_MS = 60 * 60 * 1000;   // hard-data polls: hourly per market
+export const RECHECK_HOURS = 3;             // LLM re-check cadence for other held markets
+
+/** Held markets with no hard-data source — the evaluator re-checks these every RECHECK_HOURS. */
+export const heldMarketsNeedingRecheck = new Set<string>();
+
+// ─── math helpers ────────────────────────────────────────────────────────────
+function normCdf(z: number): number {
+    // Abramowitz-Stegun erf approximation
+    const t = 1 / (1 + 0.2316419 * Math.abs(z));
+    const d = 0.3989423 * Math.exp(-z * z / 2);
+    let p = d * t * (0.3193815 + t * (-0.3565638 + t * (1.781478 + t * (-1.821256 + t * 1.330274))));
+    if (z > 0) p = 1 - p;
+    return p;
+}
+const clampP = (p: number) => Math.min(0.98, Math.max(0.02, p));
+
+// ─── USGS gauge watcher ──────────────────────────────────────────────────────
+interface UsgsSpec { site: string; threshold: number; outcome0IsBelow: boolean; deadline: number }
+
+function detectUsgs(m: EnrichedMarket): UsgsSpec | null {
+    const text = `${m.question}\n${m.resolutionContext || ''}`;
+    const site = text.match(/site\s+(\d{7,8})/i)?.[1];
+    const thr = text.match(/below\s+([\d,]+)\s*cfs/i)?.[1] ?? text.match(/([\d,]+)\s*cfs/i)?.[1];
+    const ts = text.match(/(\d{4}-\d{2}-\d{2}T\d{2}:\d{2}(?::\d{2})?Z?)/)?.[1];
+    if (!site || !thr) return null;
+    const deadline = ts ? Date.parse(ts.endsWith('Z') ? ts : ts + 'Z') : Date.parse(m.resolvesAt || '');
+    if (isNaN(deadline)) return null;
+    return {
+        site,
+        threshold: Number(thr.replace(/,/g, '')),
+        outcome0IsBelow: /below/i.test(m.question) === /yes/i.test(m.outcomes[0] || 'yes'),
+        deadline,
+    };
 }
 
-const WATCHES: UsgsWatch[] = [
-    {
-        // "Will Mississippi River discharge at Baton Rouge at 12:00 UTC on
-        //  Aug 16, 2026 be below 220,000 cfs?" — we hold No (outcome 1).
-        marketAddress: '0xb4ded804c9a64fb142313ca171f7c2dfa97baefe',
-        usgsSite: '07374000',
-        threshold: 220_000,
-        outcome0IsBelow: true,
-        deadlineIso: '2026-08-16T12:00:00Z',
-        sigma: 6_000,
-        label: 'Mississippi @ Baton Rouge',
-    },
-];
-
-const CHECK_INTERVAL_MS = 60 * 60 * 1000; // hourly per watch
-
-const normCdf = (z: number) => 0.5 * (1 + Math.tanh(Math.sqrt(Math.PI / 8) * z * 2 / Math.SQRT2));
-
-async function fetchUsgsSeries(site: string): Promise<Array<{ t: number; v: number }>> {
-    const url = `https://waterservices.usgs.gov/nwis/iv/?format=json&sites=${site}&parameterCd=00060&period=P5D`;
+async function runUsgs(m: EnrichedMarket, spec: UsgsSpec): Promise<void> {
+    if (Date.now() > spec.deadline) return;
+    const url = `https://waterservices.usgs.gov/nwis/iv/?format=json&sites=${spec.site}&parameterCd=00060&period=P5D`;
     const res = await fetch(url, { signal: AbortSignal.timeout(15_000) });
     if (!res.ok) throw new Error(`USGS ${res.status}`);
     const data: any = await res.json();
-    const values = data?.value?.timeSeries?.[0]?.values?.[0]?.value || [];
-    return values
+    const series = (data?.value?.timeSeries?.[0]?.values?.[0]?.value || [])
         .map((x: any) => ({ t: Date.parse(x.dateTime), v: Number(x.value) }))
         .filter((x: any) => isFinite(x.t) && x.v > 0);
-}
-
-async function runWatch(w: UsgsWatch, market: EnrichedMarket | undefined): Promise<void> {
-    const deadline = Date.parse(w.deadlineIso);
-    if (Date.now() > deadline) return;               // question decided; nothing to project
-    if (!market) return;                              // market not open — brackets can't act anyway
-
-    const series = await fetchUsgsSeries(w.usgsSite);
     if (series.length < 50) return;
 
     const now = series[series.length - 1]!;
-    // Trend from the last 3 days (exponential recession fit on endpoints).
     const cutoff = now.t - 3 * 86_400_000;
-    const past = series.find(s => s.t >= cutoff) || series[0]!;
+    const past = series.find((s: any) => s.t >= cutoff) || series[0]!;
     const daysSpan = (now.t - past.t) / 86_400_000;
     if (daysSpan < 0.5) return;
     const dailyFactor = Math.pow(now.v / past.v, 1 / daysSpan);
+    const projected = now.v * Math.pow(dailyFactor, (spec.deadline - now.t) / 86_400_000);
 
-    const daysToDeadline = (deadline - now.t) / 86_400_000;
-    const projected = now.v * Math.pow(dailyFactor, daysToDeadline);
+    const sigma = Math.max(3000, now.v * 0.025); // gauge forecast noise
+    const pBelow = clampP(normCdf((spec.threshold - projected) / sigma));
+    const p0 = spec.outcome0IsBelow ? pBelow : 1 - pBelow;
 
-    // P(value below threshold at deadline)
-    const z = (w.threshold - projected) / w.sigma;
-    const pBelow = Math.min(0.98, Math.max(0.02, normCdf(z)));
-    const p0 = w.outcome0IsBelow ? pBelow : 1 - pBelow;
-
-    await saveEvaluation(market.address, p0, market.impliedProbabilities[0]!, p0, market.category);
-
-    const msg = `[Watch:${w.label}] now ${Math.round(now.v)} | trend ${((dailyFactor - 1) * 100).toFixed(2)}%/day | projected ${Math.round(projected)} at deadline vs ${w.threshold} → P(outcome0)=${(p0 * 100).toFixed(1)}% (market ${(market.impliedProbabilities[0]! * 100).toFixed(1)}%)`;
+    await saveEvaluation(m.address, p0, m.impliedProbabilities[0]!, p0, m.category);
+    const msg = `[Watch:USGS ${spec.site}] now ${Math.round(now.v)} | trend ${((dailyFactor - 1) * 100).toFixed(2)}%/day | proj ${Math.round(projected)} vs ${spec.threshold} → P(outcome0)=${(p0 * 100).toFixed(1)}% (mkt ${(m.impliedProbabilities[0]! * 100).toFixed(1)}%)`;
     console.log(`  ${msg}`);
     logEvent('THINK', msg);
 }
 
-/** Called each loop; each watch runs at most hourly and never throws. */
+// ─── CoinGecko close watcher ─────────────────────────────────────────────────
+const COIN_IDS: Record<string, string> = {
+    bitcoin: 'bitcoin', btc: 'bitcoin', ethereum: 'ethereum', eth: 'ethereum',
+    solana: 'solana', sol: 'solana', dogecoin: 'dogecoin', xrp: 'ripple',
+    cardano: 'cardano', bnb: 'binancecoin',
+};
+
+interface CryptoSpec { coinId: string; threshold: number; outcome0IsAbove: boolean; measureTs: number }
+
+function detectCrypto(m: EnrichedMarket): CryptoSpec | null {
+    const q = m.question;
+    if (!/coingecko|daily close/i.test(q)) return null;
+    const coinWord = Object.keys(COIN_IDS).find(c => new RegExp(`\\b${c}\\b`, 'i').test(q));
+    const thr = q.match(/\$\s*([\d,]+(?:\.\d+)?)/)?.[1];
+    const date = q.match(/(\d{4}-\d{2}-\d{2})/)?.[1];
+    if (!coinWord || !thr || !date) return null;
+    return {
+        coinId: COIN_IDS[coinWord]!,
+        threshold: Number(thr.replace(/,/g, '')),
+        outcome0IsAbove: /or higher|at or above|greater|≥|>=/i.test(q),
+        // The daily close for day D is fixed at D+1 00:00 UTC
+        measureTs: Date.parse(date + 'T00:00:00Z') + 86_400_000,
+    };
+}
+
+async function runCrypto(m: EnrichedMarket, spec: CryptoSpec): Promise<void> {
+    if (Date.now() > spec.measureTs) return;
+    const res = await fetch(`https://api.coingecko.com/api/v3/simple/price?ids=${spec.coinId}&vs_currencies=usd`,
+        { signal: AbortSignal.timeout(15_000) });
+    if (!res.ok) throw new Error(`CoinGecko ${res.status}`);
+    const data: any = await res.json();
+    const price = data?.[spec.coinId]?.usd;
+    if (!price) return;
+
+    const days = Math.max(0.02, (spec.measureTs - Date.now()) / 86_400_000);
+    const vol = 0.035 * Math.sqrt(days); // ~3.5% daily lognormal vol for majors
+    const z = Math.log(spec.threshold / price) / vol;
+    const pAbove = clampP(1 - normCdf(z));
+    const p0 = spec.outcome0IsAbove ? pAbove : 1 - pAbove;
+
+    await saveEvaluation(m.address, p0, m.impliedProbabilities[0]!, p0, m.category);
+    const msg = `[Watch:${spec.coinId}] price $${price} vs $${spec.threshold} close in ${days.toFixed(2)}d → P(outcome0)=${(p0 * 100).toFixed(1)}% (mkt ${(m.impliedProbabilities[0]! * 100).toFixed(1)}%)`;
+    console.log(`  ${msg}`);
+    logEvent('THINK', msg);
+}
+
+// ─── Orchestrator ────────────────────────────────────────────────────────────
+/** Called each loop. Auto-detects a watcher for every open HELD market;
+ *  hard-data polls run hourly; unmatched holdings are flagged for LLM
+ *  re-checks. Never throws. */
 export async function runDataWatchers(markets: EnrichedMarket[]): Promise<void> {
-    for (const w of WATCHES) {
+    let held: string[] = [];
+    try {
+        const signer = await delphiClient.getSigner();
+        const { positions } = await delphiClient.listPositions({
+            wallet: signer.address,
+            redeemedOrLiquidated: false,
+        });
+        held = (positions || []).map(p => p.marketProxy.toLowerCase());
+    } catch { return; }
+
+    heldMarketsNeedingRecheck.clear();
+
+    for (const addr of new Set(held)) {
+        const market = markets.find(m => m.address.toLowerCase() === addr);
+        if (!market) continue; // closed for trading — brackets can't act anyway
+
         try {
-            const key = `watchLastRun_${w.usgsSite}_${w.marketAddress.slice(0, 10)}`;
+            const usgs = detectUsgs(market);
+            const crypto = usgs ? null : detectCrypto(market);
+
+            if (!usgs && !crypto) {
+                heldMarketsNeedingRecheck.add(addr);
+                continue;
+            }
+
+            const key = `watchLastRun_${addr.slice(0, 12)}`;
             const last = Number(await getState(key)) || 0;
             if (Date.now() - last < CHECK_INTERVAL_MS) continue;
             await setState(key, String(Date.now()));
 
-            const market = markets.find(m => m.address.toLowerCase() === w.marketAddress);
-            await runWatch(w, market);
+            if (usgs) await runUsgs(market, usgs);
+            else if (crypto) await runCrypto(market, crypto);
         } catch (e) {
-            console.warn(`  [Watch] ${w.label} failed:`, (e as Error).message?.slice(0, 120));
+            console.warn(`  [Watch] ${addr.slice(0, 10)} failed:`, (e as Error).message?.slice(0, 120));
         }
     }
 }

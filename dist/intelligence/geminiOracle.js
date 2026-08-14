@@ -41,22 +41,35 @@ ${input.marketContext || 'no flow data'}
 RECENT NEWS HEADLINES (may be incomplete or irrelevant):
 ${articleBlock}
 
-TASK — work through these steps:
-1. SCENARIO ENUMERATION: List every plausible outcome path (including edge cases: exact-threshold results, ties, cancellation, postponement, no official announcement in time) and which outcome each path pays under a literal reading of the rules.
-2. TIME AWARENESS: Compare the current UTC time above against any deadline in the question.
-   - If the deadline has ALREADY PASSED, the outcome is a matter of verifiable fact, not forecasting. Search for what actually happened and price near-certainty (0.95-0.99 in the confirmed direction). Set eventConcluded=true.
-   - If the question is "will X happen before T" and time is running out with no scheduled/likely occurrence, probability must decay toward the no-occurrence side accordingly.
-3. BASE RATES: For statistical questions (score margins, goal totals, temperature thresholds, price thresholds), start from historical base rates and distributions (e.g. league goal averages, climatological norms, asset volatility) and only adjust for concrete, specific evidence (announced lineups, weather forecasts, schedules). Headline TONE/sentiment is NOT evidence for quantitative questions.
-4. SEARCH: Use search to find decisive current facts (forecasts, schedules, official announcements, injury reports) relevant to the resolution criteria.
-5. SYNTHESIZE a final probability that OUTCOME 0 ("${input.outcomes[0]}") wins.
+THE MARKET PRICE IS EVIDENCE, NOT A TARGET.
+That ${(input.currentImpliedProb * 100).toFixed(1)}% is the aggregated judgement of ~90 competing trading agents, most of them LLM-driven with web search, all reading the same public information and betting real stakes on being right. When your estimate disagrees sharply with theirs, the overwhelmingly likely explanation is that YOU have misread something — not that 90 funded agents all missed an obvious fact. Treat a large disagreement as a red flag to re-examine your reasoning, not as a discovered edge.
+You may only override the crowd decisively when you can name a SPECIFIC, VERIFIABLE, PUBLIC fact that settles the question and that the price clearly does not reflect. If you cannot name that fact in one sentence, you do not have an edge — stay near the market price.
 
-IMPORTANT RULES:
-- If evidence is mixed, inconclusive or you have no clear edge, stay close to the current market price of ${(input.currentImpliedProb * 100).toFixed(1)}%.
+TASK — work through these steps:
+1. READ THE RULES IN PRECEDENCE ORDER. Clarifications, definitions and exclusions OVERRIDE the headline question and the summary clauses. If a clause says "announced or available" but a clarification defines the term as requiring availability, or excludes internal/rumored/unreleased items, THE CLARIFICATION WINS. Quote the controlling clause to yourself before deciding.
+2. AMBIGUITY CHECK (critical). Ask: could two careful arbitrators reading these exact criteria reach OPPOSITE verdicts on the known facts?
+   - "severe" = the clauses genuinely conflict, or the outcome turns on interpreting a word (e.g. "release" vs "announce") rather than on any fact.
+   - "minor" = mostly clear, one secondary term is fuzzy.
+   - "none" = any competent arbitrator reaches the same verdict.
+   When ambiguity is "severe", knowing the facts does NOT make you confident — the uncertainty has moved from the world into the wording. Your probability must reflect that, and must stay close to the market price.
+3. SCENARIO ENUMERATION: List every plausible outcome path (exact-threshold results, ties, cancellation, postponement, no official announcement in time) and which outcome each pays under a literal reading.
+4. TIME AWARENESS: Compare current UTC time against any deadline.
+   - Deadline ALREADY PASSED and criteria unambiguous → the outcome is verifiable fact; search for what happened and price near-certainty. Set eventConcluded=true.
+   - Deadline PASSED but criteria ambiguous → eventConcluded=true, ambiguity="severe", and stay near the market: the facts are settled, the verdict is not.
+   - "Will X happen before T" with little time left and no scheduled occurrence → decay toward the no-occurrence side.
+   - Note: little time remaining also means the market has had maximum opportunity to price everything public. Late, large disagreements are usually errors.
+5. BASE RATES: For statistical questions (margins, goal totals, temperature and price thresholds), start from historical base rates and distributions, adjusting only for concrete evidence (lineups, forecasts, schedules). Headline TONE is NOT evidence.
+6. SEARCH for decisive current facts relevant to the controlling clause.
+7. SYNTHESIZE a probability that OUTCOME 0 ("${input.outcomes[0]}") wins.
+
+CALIBRATION RULES:
+- Reserve probabilities above 0.90 or below 0.10 for outcomes that are already determined AND governed by unambiguous criteria.
+- If evidence is mixed, inconclusive, or the criteria are ambiguous, stay close to ${(input.currentImpliedProb * 100).toFixed(1)}%.
 - Be honest about uncertainty. Do not fabricate confidence.
-- The probability MUST refer to OUTCOME 0 ("${input.outcomes[0]}"), not to "yes" in a colloquial sense.
+- The probability MUST refer to OUTCOME 0 ("${input.outcomes[0]}"), not to "yes" colloquially.
 
 Respond with ONLY a JSON object in exactly this format (no markdown fences, no extra text):
-{"probability": <float 0.0-1.0>, "reasoning": "<2-3 sentence summary>", "eventConcluded": <true|false>}`;
+{"probability": <float 0.0-1.0>, "reasoning": "<2-3 sentences, naming the controlling clause>", "eventConcluded": <true|false>, "ambiguity": "none"|"minor"|"severe", "deviationJustification": "<one sentence naming the specific public fact the market is missing, or null if you have no such fact>"}`;
 }
 function extractJson(text) {
     // Model may wrap JSON in fences or prose; grab the first {...} block.
@@ -87,7 +100,7 @@ async function callGemini(prompt, useGrounding) {
  */
 export async function getGeminiProbability(input, retries = 3) {
     if (!apiKey) {
-        return { probability: input.currentImpliedProb, reasoning: "No Gemini API key configured.", eventConcluded: false };
+        return { probability: input.currentImpliedProb, reasoning: "No Gemini API key configured.", eventConcluded: false, ambiguity: "none", deviationJustification: null };
     }
     const prompt = buildPrompt(input);
     let useGrounding = true;
@@ -96,11 +109,21 @@ export async function getGeminiProbability(input, retries = 3) {
             const responseText = await callGemini(prompt, useGrounding);
             const data = extractJson(responseText);
             if (data && typeof data.probability === 'number' && data.probability >= 0 && data.probability <= 1) {
-                console.log(`  [Gemini${useGrounding ? '+search' : ''}] P(${input.outcomes[0]}): ${data.probability.toFixed(4)} | concluded: ${!!data.eventConcluded} | ${data.reasoning}`);
+                const ambiguity = data.ambiguity === 'severe' || data.ambiguity === 'minor' ? data.ambiguity : 'none';
+                const justification = typeof data.deviationJustification === 'string'
+                    && data.deviationJustification.trim().length > 0
+                    && data.deviationJustification.trim().toLowerCase() !== 'null'
+                    ? data.deviationJustification.trim()
+                    : null;
+                console.log(`  [Gemini${useGrounding ? '+search' : ''}] P(${input.outcomes[0]}): ${data.probability.toFixed(4)} | concluded: ${!!data.eventConcluded} | ambiguity: ${ambiguity} | ${data.reasoning}`);
+                if (justification)
+                    console.log(`  [Gemini] Claimed edge: ${justification}`);
                 return {
                     probability: data.probability,
                     reasoning: data.reasoning || "No reasoning provided.",
                     eventConcluded: !!data.eventConcluded,
+                    ambiguity,
+                    deviationJustification: justification,
                 };
             }
             throw new Error(`Invalid/unparseable Gemini response: ${responseText.slice(0, 200)}`);
@@ -117,7 +140,7 @@ export async function getGeminiProbability(input, retries = 3) {
             }
             if (attempt === retries) {
                 console.error(`Gemini Oracle failed after ${retries} attempts. Returning market price as fallback.`);
-                return { probability: input.currentImpliedProb, reasoning: "Gemini API unavailable. Returning market price.", eventConcluded: false };
+                return { probability: input.currentImpliedProb, reasoning: "Gemini API unavailable. Returning market price.", eventConcluded: false, ambiguity: "none", deviationJustification: null };
             }
             const backoffMs = Math.pow(2, attempt) * 1000 + Math.random() * 1000;
             if (isRateLimit) {
@@ -129,5 +152,5 @@ export async function getGeminiProbability(input, retries = 3) {
             await delay(backoffMs);
         }
     }
-    return { probability: input.currentImpliedProb, reasoning: "Exhausted retries.", eventConcluded: false };
+    return { probability: input.currentImpliedProb, reasoning: "Exhausted retries.", eventConcluded: false, ambiguity: "none", deviationJustification: null };
 }

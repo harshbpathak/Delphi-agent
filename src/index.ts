@@ -348,10 +348,14 @@ async function candidateFromStoredEval(market: EnrichedMarket, predictedProb: nu
         market,
         prediction: {
             probability: predictedProb,
+            rawProb: predictedProb,
             geminiProb: predictedProb,
             pythonProb: null,
             reasoning: 'Cached recent evaluation, re-priced at current market price.',
             eventConcluded: false,
+            ambiguity: 'none',
+            weightOnMarket: 0,
+            consensusNote: 'cached',
         },
         outcomeIdx, effectiveProb, spotPrice, provisionalEdge,
         flowTrades24h: flow.trades24h,
@@ -404,7 +408,11 @@ async function evaluateMarkets(markets: EnrichedMarket[], guardrails: RiskGuardr
         const flow = await getMarketFlow(market.address);
         console.log(`   🌊 Flow: ${flow.summary}`);
 
-        const prediction = await getCombinedProbability(market, articles, true, flow.summary);
+        const prediction = await getCombinedProbability(market, articles, true, {
+            summary: flow.summary,
+            trades24h: flow.trades24h,
+            uniqueWallets24h: flow.uniqueWallets24h,
+        });
 
         // Rate-limit bailout: a fallback answer means the Gemini call failed
         // after retries. Two in a row → the RPM window is saturated; stop
@@ -430,7 +438,7 @@ async function evaluateMarkets(markets: EnrichedMarket[], guardrails: RiskGuardr
         const spotPrice = market.spotPrices[outcomeIdx] ?? (outcomeIdx === 0 ? currentImpliedProb : 1 - currentImpliedProb);
         const provisionalEdge = netEdge(effectiveProb, spotPrice, market.tradingFee);
 
-        console.log(`   🧠 P("${market.outcomes[0]}") = ${(prediction.probability * 100).toFixed(2)}% (market: ${(currentImpliedProb * 100).toFixed(2)}%)${prediction.eventConcluded ? ' [event concluded]' : ''}`);
+        console.log(`   🧠 P("${market.outcomes[0]}") = ${(prediction.probability * 100).toFixed(2)}% (raw ${(prediction.rawProb * 100).toFixed(1)}%, market ${(currentImpliedProb * 100).toFixed(2)}%)${prediction.eventConcluded ? ' [VERIFIED FACT]' : ''}${prediction.ambiguity !== 'none' ? ` [ambiguity: ${prediction.ambiguity}]` : ''}`);
         console.log(`   ⚡ Best side: "${market.outcomes[outcomeIdx]}" | provisional net edge: ${(provisionalEdge * 100).toFixed(2)}%`);
         console.log(`   💬 ${prediction.reasoning}`);
 

@@ -2,18 +2,33 @@ import { getGeminiProbability, GeminiMarketInput, GeminiPrediction } from './gem
 import { getPythonProbability } from './pythonOracle.js';
 import { EnrichedMarket } from '../execution/marketScanner.js';
 import { ScrapedArticle } from '../ingestion/rssScraper.js';
+import { applyMarketConsensus } from './marketConsensus.js';
 
 export interface CombinedPrediction {
-    /** Final combined probability that OUTCOME 0 wins */
+    /** Final probability that OUTCOME 0 wins, after market-consensus dampening */
     probability: number;
+    /** Our raw (undampened) view, for diagnostics */
+    rawProb: number;
     /** Gemini's individual probability */
     geminiProb: number;
     /** Python ML's individual probability (null if service down) */
     pythonProb: number | null;
     /** Gemini's reasoning */
     reasoning: string;
-    /** Whether Gemini believes the event outcome is already determined */
+    /** Whether the event outcome is already determined AND rules are clean */
     eventConcluded: boolean;
+    /** Criteria ambiguity as judged by the oracle */
+    ambiguity: 'none' | 'minor' | 'severe';
+    /** How much weight the dampener placed on the market price */
+    weightOnMarket: number;
+    /** Human-readable dampener note */
+    consensusNote: string;
+}
+
+export interface MarketFlowStats {
+    summary: string;
+    trades24h: number;
+    uniqueWallets24h: number;
 }
 
 // Gemini (evidence + search + resolution-criteria reasoning) dominates.
@@ -33,9 +48,10 @@ export async function getCombinedProbability(
     market: EnrichedMarket,
     articles: ScrapedArticle[],
     callGemini: boolean,
-    marketContext: string | null = null
+    flow: MarketFlowStats | null = null
 ): Promise<CombinedPrediction> {
     const currentImpliedProb = market.impliedProbabilities[0]!;
+    const marketContext = flow?.summary ?? null;
 
     const geminiInput: GeminiMarketInput = {
         question: market.question,
@@ -56,6 +72,8 @@ export async function getCombinedProbability(
             probability: currentImpliedProb,
             reasoning: "Gemini daily budget exhausted — no LLM evaluation.",
             eventConcluded: false,
+            ambiguity: 'none' as const,
+            deviationJustification: null,
         });
 
     const [geminiResult, pythonResult] = await Promise.all([
@@ -70,27 +88,50 @@ export async function getCombinedProbability(
 
     const geminiProb = geminiResult.probability;
 
+    // 1. Our own view: Gemini, lightly adjusted by the on-chain flow signal.
+    let rawProb = geminiProb;
     if (pythonResult !== null && !geminiResult.eventConcluded) {
         const pythonWeight = PYTHON_MAX_WEIGHT * Math.min(Math.max(pythonResult.confidence, 0), 1);
         const totalWeight = GEMINI_WEIGHT + pythonWeight;
-        const combined = (geminiProb * GEMINI_WEIGHT + pythonResult.probability * pythonWeight) / totalWeight;
+        rawProb = (geminiProb * GEMINI_WEIGHT + pythonResult.probability * pythonWeight) / totalWeight;
+        console.log(`  [Combined] Gemini: ${geminiProb.toFixed(4)} (w=${GEMINI_WEIGHT.toFixed(2)}) + Python: ${pythonResult.probability.toFixed(4)} (w=${pythonWeight.toFixed(2)}) = ${rawProb.toFixed(4)}`);
+    }
 
-        console.log(`  [Combined] Gemini: ${geminiProb.toFixed(4)} (w=${GEMINI_WEIGHT.toFixed(2)}) + Python: ${pythonResult.probability.toFixed(4)} (w=${pythonWeight.toFixed(2)}) = ${combined.toFixed(4)}`);
+    // 2. Shrink toward the crowd. 90 funded agents priced this too; a large
+    //    disagreement is far more often our error than their blind spot.
+    const hoursToResolve = (() => {
+        const iso = market.resolvesAt || market.settlesAt;
+        if (!iso) return null;
+        const t = Date.parse(iso);
+        return isNaN(t) ? null : (t - Date.now()) / 3600_000;
+    })();
 
-        return {
-            probability: combined,
-            geminiProb,
-            pythonProb: pythonResult.probability,
-            reasoning: geminiResult.reasoning,
-            eventConcluded: false,
-        };
+    const consensus = applyMarketConsensus({
+        rawProb,
+        marketProb: currentImpliedProb,
+        hoursToResolve,
+        trades24h: flow?.trades24h ?? 0,
+        uniqueWallets24h: flow?.uniqueWallets24h ?? 0,
+        eventConcluded: geminiResult.eventConcluded,
+        ambiguity: geminiResult.ambiguity,
+        hasJustification: geminiResult.deviationJustification !== null,
+    });
+
+    if (Math.abs(consensus.probability - rawProb) > 0.005) {
+        console.log(`  [Consensus] ${consensus.note}`);
     }
 
     return {
-        probability: geminiProb,
+        probability: consensus.probability,
+        rawProb,
         geminiProb,
         pythonProb: pythonResult?.probability ?? null,
         reasoning: geminiResult.reasoning,
-        eventConcluded: geminiResult.eventConcluded,
+        // Only a clean verified fact counts as "concluded" downstream — that
+        // flag unlocks larger sizing, so ambiguous criteria must not set it.
+        eventConcluded: consensus.verifiedFact,
+        ambiguity: geminiResult.ambiguity,
+        weightOnMarket: consensus.weightOnMarket,
+        consensusNote: consensus.note,
     };
 }

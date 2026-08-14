@@ -164,7 +164,13 @@ export async function getOpenCost(marketAddress: string): Promise<number> {
     return row?.cost || 0;
 }
 
-export async function recordSettlement(marketAddress: string, kind: 'redeem' | 'liquidate' | 'sell', proceedsTokens: number) {
+/** True once a market has been closed out in the journal (redeem/liquidate/sell/loss). */
+export async function settlementExists(marketAddress: string): Promise<boolean> {
+    const row = await db.get('SELECT 1 AS x FROM settlements WHERE market_address = ?', [marketAddress]);
+    return !!row;
+}
+
+export async function recordSettlement(marketAddress: string, kind: 'redeem' | 'liquidate' | 'sell' | 'loss', proceedsTokens: number) {
     const cost = await getOpenCost(marketAddress);
     await db.run(
         `INSERT INTO settlements (market_address, kind, proceeds_tokens, cost_tokens, pnl_tokens, settled_at)

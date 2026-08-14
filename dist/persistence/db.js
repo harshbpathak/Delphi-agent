@@ -111,6 +111,11 @@ export async function getOpenCost(marketAddress) {
            AND market_address NOT IN (SELECT market_address FROM settlements)`, [marketAddress]);
     return row?.cost || 0;
 }
+/** True once a market has been closed out in the journal (redeem/liquidate/sell/loss). */
+export async function settlementExists(marketAddress) {
+    const row = await db.get('SELECT 1 AS x FROM settlements WHERE market_address = ?', [marketAddress]);
+    return !!row;
+}
 export async function recordSettlement(marketAddress, kind, proceedsTokens) {
     const cost = await getOpenCost(marketAddress);
     await db.run(`INSERT INTO settlements (market_address, kind, proceeds_tokens, cost_tokens, pnl_tokens, settled_at)

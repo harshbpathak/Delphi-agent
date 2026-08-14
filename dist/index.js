@@ -1,6 +1,6 @@
 import * as dotenv from 'dotenv';
 dotenv.config();
-import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, getOpenEntry, performanceStats, } from './persistence/db.js';
+import { initDatabase, getState, setState, getLastEvaluation, saveEvaluation, recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot, openCostByCategory, getOpenEntry, performanceStats, settlementExists, getOpenCost, } from './persistence/db.js';
 import { scanOpenMarkets } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles } from './ingestion/rssScraper.js';
 import { getCombinedProbability } from './intelligence/index.js';
@@ -103,6 +103,27 @@ async function sweepSettledPositions() {
             try {
                 const status = await delphiClient.getMarketStatus(pos.marketProxy);
                 if (status === 'settled') {
+                    // A settled market we hold the LOSING side of pays nothing and
+                    // redeem() reverts. Journal the loss once, then leave it alone —
+                    // otherwise the loss never reaches the circuit breaker or the
+                    // calibration gate, and the sweep retries it every loop forever.
+                    let winningIdx = null;
+                    try {
+                        const m = await delphiClient.getMarket({ id: pos.marketProxy });
+                        winningIdx = m.winningOutcomeIdx === null ? null : Number(m.winningOutcomeIdx);
+                    }
+                    catch { /* unknown winner → fall through and attempt redeem */ }
+                    if (winningIdx !== null && Number(pos.outcomeIdx) !== winningIdx) {
+                        if (await settlementExists(pos.marketProxy))
+                            continue; // already journalled
+                        const lostCost = await getOpenCost(pos.marketProxy);
+                        await recordSettlement(pos.marketProxy, 'loss', 0);
+                        const shares = Number(pos.shares) / 1e18;
+                        console.log(`  ❌ Lost market ${pos.marketProxy}: ${shares.toFixed(2)} shares of outcome ${pos.outcomeIdx} expired worthless (winner was ${winningIdx}). Cost ${lostCost.toFixed(2)} TST written off.`);
+                        logEvent('SKIP', `LOSS booked: ${shares.toFixed(1)} shares of outcome ${pos.outcomeIdx} worthless, winner ${winningIdx} — cost ${lostCost.toFixed(2)} TST — ${pos.marketProxy}`);
+                        await notify(`❌ *LOSS* — market settled against us\n\`${pos.marketProxy}\`\n${shares.toFixed(1)} shares of outcome ${pos.outcomeIdx} expired worthless. Written off: ${lostCost.toFixed(2)} TST.`);
+                        continue;
+                    }
                     console.log(`  Redeeming settled market ${pos.marketProxy}...`);
                     const { tokensOut } = await delphiClient.redeemMarket({
                         marketAddress: pos.marketProxy,

@@ -16,7 +16,7 @@ export const DEFAULT_GUARDRAILS: RiskGuardrails = {
     maxSingleBetPct: 0.08,        // Cap any single trade at 8% of bankroll (raised from 5% in chase mode)
     minEdgeThreshold: 0.03,       // Require at least 3% net edge
     minBankrollThreshold: 5.0,    // Stop trading completely if bankroll < 5 tokens
-    reserveRatio: 0.40,           // Keep 40% of capital liquid, only risk from 60% allocatable pool
+    reserveRatio: 0.15,           // Keep 15% liquid — leader-style deployment; idle cash earns nothing
 };
 
 /**

@@ -18,8 +18,8 @@ import { LIQUIDATABLE_MARKET_STATUSES } from '@gensyn-ai/gensyn-delphi-sdk';
 const POLL_INTERVAL_MS = 5 * 60 * 1000; // 5 minutes between loop STARTS (no overlap: next loop is scheduled after the previous finishes)
 const INTER_EVAL_DELAY_MS = 15_000; // Pause between Gemini evaluations (free tier RPM + grounding headroom)
 const MAX_EVALS_PER_LOOP = 6; // Bound loop duration & Gemini usage per loop
-const MAX_TRADES_PER_LOOP = 2; // Max trades per loop (anti-overtrading)
-const MAX_DAILY_TRADES = 20; // Max trades per 24 hours
+const MAX_TRADES_PER_LOOP = 3; // Max trades per loop (anti-overtrading)
+const MAX_DAILY_TRADES = 30; // Max trades per 24 hours (leader averages ~25 events/day)
 const MAX_DAILY_GEMINI_CALLS = 200; // Max Gemini API calls per 24 hours (free tier RPD headroom)
 const MAX_SLIPPAGE_BPS = 200n; // 2% max slippage
 const PRICE_MOVE_REEVAL_THRESHOLD = 0.03; // Re-evaluate a market if price moved 3% since last eval
@@ -28,7 +28,8 @@ const NEAR_SETTLE_REEVAL_INTERVAL_MS = 60 * 60 * 1000;
 const CIRCUIT_BREAKER_LOOKBACK = 10; // Halt if the last N settled positions...
 const CIRCUIT_BREAKER_MIN_SETTLED = 5; // ...(at least this many) lost more than...
 const CIRCUIT_BREAKER_MAX_DRAWDOWN = 0.25; // ...25% of current bankroll
-const MAX_CATEGORY_EXPOSURE_PCT = 0.15; // Max 15% of bankroll in open positions per category (correlation guard)
+const MAX_CATEGORY_EXPOSURE_PCT = 0.25; // Max 25% of bankroll in open positions per category (correlation guard)
+const MAX_MARKET_EXPOSURE_PCT = 0.20; // Max 20% of bankroll in ONE market — allows leader-style scale-ins, bounded
 const TOKEN_DECIMALS = 6;
 const DRY_RUN = process.env.DRY_RUN === 'true';
 // Shared snapshots for the dashboard / Telegram providers
@@ -156,19 +157,25 @@ async function sweepSettledPositions() {
         console.error("Sweep failed:", e);
     }
 }
-// ─── Exit Manager: take-profit / stop-loss / edge-exhausted ──────────────────
-const EXIT_EDGE_THRESHOLD = 0.01; // Backstop: sell when remaining net edge < 1%
-const TAKE_PROFIT_PCT = 0.20; // Harvest winners at +20% vs entry...
-const HOLD_EDGE_PCT = 0.10; // ...unless the model still sees ≥10% edge (let monsters run)
+// ─── Exit Manager: stop-loss / free-roll / edge-exhausted ────────────────────
+const EXIT_EDGE_THRESHOLD = 0.01; // Backstop: full exit when remaining net edge < 1%
 const STOP_LOSS_PCT = 0.30; // Hard stop: cut any position down 30% from entry
+const FREE_ROLL_GAIN_PCT = 0.20; // Winner up ≥20% vs entry → recover the cost, ride the rest
+const FREE_ROLL_MAX_FRACTION = 0.70; // Never sell more than 70% of a position in the free-roll pass
+const FREE_ROLL_MIN_COST = 1.0; // Don't bother free-rolling dust cost bases
 const SELL_SLIPPAGE_BPS = 200n;
 /**
- * Bracket-style exits on every open position, evaluated each loop:
- *  1. STOP-LOSS   — mark ≤ entry × (1 − 30%): sell unconditionally.
- *  2. TAKE-PROFIT — mark ≥ entry × (1 + 20%): sell and recycle the capital,
- *     unless our current estimate still gives the position ≥10% net edge.
- *  3. EDGE GONE   — remaining net edge < 1%: sell regardless of PnL
+ * Leader-style exits on every open position, evaluated each loop:
+ *  1. STOP-LOSS  — mark ≤ entry × (1 − 30%): sell everything unconditionally.
+ *  2. EDGE GONE  — remaining net edge < 1%: sell everything regardless of PnL
  *     (converged winners and thesis reversals both land here).
+ *  3. FREE-ROLL  — winner up ≥20% with edge still intact: sell just enough
+ *     shares to recover the ENTIRE cost basis, then ride the remainder to
+ *     settlement risk-free. This is the leader's signature move — in 4 of
+ *     their 6 settled markets they pre-sold 23–88% of shares to cover cost
+ *     and redeemed the residual as pure profit.
+ *  A free-rolled position (net cost ≤ 0) can no longer stop-loss — there is
+ *  nothing left to lose — and only exits fully when its edge dies.
  */
 async function exitExhaustedPositions(markets) {
     let signer;
@@ -206,20 +213,70 @@ async function exitExhaustedPositions(markets) {
             const lastEval = await getLastEvaluation(market.address);
             const pOut = lastEval ? (idx === 0 ? lastEval.predicted_prob : 1 - lastEval.predicted_prob) : null;
             const remainingEdge = pOut !== null ? netEdge(pOut, price, market.tradingFee) : null;
-            // Entry basis from the journal (avg price actually paid).
+            // Entry basis from the journal. Net of prior partial sells — a
+            // free-rolled position shows netCost ≤ 0.
             const entry = await getOpenEntry(market.address, idx);
-            const entryPrice = entry && entry.shares > 0 ? entry.costTokens / entry.shares : null;
+            const netCost = entry?.costTokens ?? null;
+            const freeRolled = netCost !== null && netCost <= FREE_ROLL_MIN_COST * 0.5;
+            const entryPrice = entry && entry.shares > 0 && !freeRolled ? entry.costTokens / entry.shares : null;
             const gainPct = entryPrice ? price / entryPrice - 1 : null;
+            // FREE-ROLL: winner with edge intact → recover the cost basis,
+            // keep the rest as a risk-free claim on settlement.
+            if (!freeRolled && gainPct !== null && gainPct >= FREE_ROLL_GAIN_PCT
+                && remainingEdge !== null && remainingEdge >= EXIT_EDGE_THRESHOLD
+                && netCost !== null && netCost >= FREE_ROLL_MIN_COST) {
+                const targetShares = Math.min(netCost / price, sharesNum * FREE_ROLL_MAX_FRACTION);
+                let sellShares = sharesToBigint(targetShares);
+                if (sellShares > sharesIn)
+                    sellShares = sharesIn;
+                const quote = await delphiClient.quoteSell({
+                    marketAddress: market.address,
+                    outcomeIdx: idx,
+                    sharesIn: sellShares,
+                });
+                const proceeds = tokensFromBigint(quote.tokensOut);
+                const sellEff = proceeds / sharesFromBigint(sellShares);
+                if (sellEff < price * 0.9) {
+                    console.log(`   ⏭️  Free-roll skipped for ${market.address}: sell slippage too deep.`);
+                    continue;
+                }
+                console.log(`🎲 FREE-ROLL "${market.question.slice(0, 55)}": selling ${sharesFromBigint(sellShares).toFixed(2)}/${sharesNum.toFixed(2)} shares @ ~${sellEff.toFixed(3)} → ${proceeds.toFixed(2)} TST recovers cost ${netCost.toFixed(2)}. Rest rides free.`);
+                let txHash = null;
+                if (!DRY_RUN) {
+                    const res = await delphiClient.sellShares({
+                        marketAddress: market.address,
+                        outcomeIdx: idx,
+                        sharesIn: sellShares,
+                        minTokensOut: quote.tokensOut * (10000n - SELL_SLIPPAGE_BPS) / 10000n,
+                    });
+                    txHash = res.transactionHash;
+                }
+                // Journal the sell leg as a negative trade row: net position and
+                // net cost stay correct, and the market is NOT closed out.
+                await recordTrade({
+                    marketAddress: market.address,
+                    question: market.question,
+                    category: market.category,
+                    outcomeIdx: idx,
+                    outcomeLabel: market.outcomes[idx],
+                    predictedProb: pOut ?? 0,
+                    marketPrice: price,
+                    effectivePrice: sellEff,
+                    shares: -sharesFromBigint(sellShares),
+                    costTokens: -proceeds,
+                    dryRun: DRY_RUN,
+                    txHash,
+                });
+                logEvent('SELL', `FREE-ROLL: recovered ${proceeds.toFixed(2)} TST (cost ${netCost.toFixed(2)}) selling ${sharesFromBigint(sellShares).toFixed(1)} of ${sharesNum.toFixed(1)} "${market.outcomes[idx]}" — remainder rides free — "${market.question.slice(0, 55)}"${DRY_RUN ? ' [DRY]' : ''}`);
+                await notify(`🎲 *FREE-ROLL* on _${market.question.slice(0, 80)}_\nSold ${sharesFromBigint(sellShares).toFixed(1)} of ${sharesNum.toFixed(1)} shares for *${proceeds.toFixed(2)} TST* — full cost recovered. Remaining ${(sharesNum - sharesFromBigint(sellShares)).toFixed(1)} shares are pure upside.`);
+                continue;
+            }
             let reason = null;
             if (gainPct !== null && gainPct <= -STOP_LOSS_PCT) {
                 reason = `STOP-LOSS (${(gainPct * 100).toFixed(1)}% vs entry ${entryPrice.toFixed(3)})`;
             }
             else if (remainingEdge !== null && remainingEdge < EXIT_EDGE_THRESHOLD) {
-                reason = `edge exhausted (${(remainingEdge * 100).toFixed(1)}%)`;
-            }
-            else if (gainPct !== null && gainPct >= TAKE_PROFIT_PCT &&
-                (remainingEdge === null || remainingEdge < HOLD_EDGE_PCT)) {
-                reason = `TAKE-PROFIT (+${(gainPct * 100).toFixed(1)}% vs entry ${entryPrice.toFixed(3)})`;
+                reason = `edge exhausted (${(remainingEdge * 100).toFixed(1)}%)${freeRolled ? ' — free-roll ride ends' : ''}`;
             }
             if (!reason)
                 continue; // keep holding
@@ -284,6 +341,10 @@ function scoreCandidate(c) {
         s *= 1.2;
     if (c.crowdBoost)
         s *= 1.15;
+    // The leader's whole book lives at 0.35–0.80: where information edges are
+    // largest and payoffs aren't lottery-shaped. Prefer that band.
+    if (c.spotPrice >= 0.35 && c.spotPrice <= 0.80)
+        s *= 1.1;
     return s;
 }
 /** Crowd-against-us: rivals bought the opposite outcome ≥3× harder than ours. */
@@ -430,6 +491,7 @@ async function evaluateMarkets(markets, guardrails) {
 }
 // ─── Execution Phase ─────────────────────────────────────────────────────────
 const MAX_ENTRY_PRICE = 0.92; // DON'T chase: never buy above 0.92 unless the fact is verified
+const MIN_ENTRY_PRICE = 0.15; // DON'T buy longshots below 0.15 unless the fact is verified
 const VERIFIED_FACT_BET_PCT = 0.15; // Deterministic-fact trades earn a larger cap (still hard-capped)
 const MIN_TRADE_PROFIT_TST = 0.5; // DON'T churn: skip trades whose expected profit can't clear fees meaningfully
 async function executeCandidate(c, bankroll, guardrails) {
@@ -446,6 +508,14 @@ async function executeCandidate(c, bankroll, guardrails) {
     if ((exposure[market.category] || 0) >= bankroll * MAX_CATEGORY_EXPOSURE_PCT) {
         console.log(`   ⏭️  Category "${market.category}" already at max exposure (${(exposure[market.category] || 0).toFixed(1)} TST). Skipping.`);
         logEvent('SKIP', `"${market.question.slice(0, 60)}": ${market.category} exposure cap reached`);
+        return 0;
+    }
+    // Scale-in guard: adds to an existing position are allowed (the leader
+    // scales into conviction), but one market never exceeds 20% of bankroll.
+    const existing = await getOpenEntry(market.address, outcomeIdx);
+    if (existing && existing.costTokens >= bankroll * MAX_MARKET_EXPOSURE_PCT) {
+        console.log(`   ⏭️  Market already at max exposure (${existing.costTokens.toFixed(1)} TST). Skipping scale-in.`);
+        logEvent('SKIP', `"${market.question.slice(0, 60)}": per-market exposure cap reached`);
         return 0;
     }
     // Provisional sizing at spot price to pick a probe share amount.
@@ -473,6 +543,14 @@ async function executeCandidate(c, bankroll, guardrails) {
     if (effectivePrice > MAX_ENTRY_PRICE && !isVerifiedFact) {
         console.log(`   ⏭️  Entry price ${effectivePrice.toFixed(3)} > ${MAX_ENTRY_PRICE} without verified fact. Skipping (asymmetric downside).`);
         logEvent('SKIP', `"${market.question.slice(0, 60)}": price ${effectivePrice.toFixed(2)} too high without verification`);
+        return 0;
+    }
+    // DON'T buy lottery tickets: below 0.15 the "edge" is usually our model
+    // overriding the crowd on a longshot (the Astra failure mode). The leader
+    // has zero entries under 0.10. Verified facts are exempt.
+    if (effectivePrice < MIN_ENTRY_PRICE && !isVerifiedFact) {
+        console.log(`   ⏭️  Entry price ${effectivePrice.toFixed(3)} < ${MIN_ENTRY_PRICE} without verified fact. Skipping (longshot filter).`);
+        logEvent('SKIP', `"${market.question.slice(0, 60)}": longshot at ${effectivePrice.toFixed(2)} without verification`);
         return 0;
     }
     // Re-size on the effective price; scale the order down if needed.

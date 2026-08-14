@@ -180,6 +180,8 @@ const STOP_LOSS_PCT = 0.30; // Hard stop: cut any position down 30% from entry
 const FREE_ROLL_GAIN_PCT = 0.20; // Winner up ≥20% vs entry → recover the cost, ride the rest
 const FREE_ROLL_MAX_FRACTION = 0.70; // Never sell more than 70% of a position in the free-roll pass
 const FREE_ROLL_MIN_COST = 1.0; // Don't bother free-rolling dust cost bases
+const PROFIT_TARGET_PCT = 0.05; // Scalp rule: square off fully at +5% vs entry...
+const PROFIT_TARGET_EDGE_CEIL = 0.03; // ...but only once the remaining edge is under 3% (don't cap big winners)
 const SELL_SLIPPAGE_BPS = 200n;
 /**
  * Leader-style exits on every open position, evaluated each loop:
@@ -295,6 +297,12 @@ async function exitExhaustedPositions(markets) {
             else if (remainingEdge !== null && remainingEdge < EXIT_EDGE_THRESHOLD) {
                 reason = `edge exhausted (${(remainingEdge * 100).toFixed(1)}%)${freeRolled ? ' — free-roll ride ends' : ''}`;
             }
+            else if (gainPct !== null && gainPct >= PROFIT_TARGET_PCT
+                && remainingEdge !== null && remainingEdge < PROFIT_TARGET_EDGE_CEIL) {
+                // Scalp square-off: the move we predicted has mostly happened —
+                // book the profit and put the capital back to work.
+                reason = `PROFIT TARGET (+${(gainPct * 100).toFixed(1)}% vs entry ${entryPrice.toFixed(3)}, residual edge ${(remainingEdge * 100).toFixed(1)}%)`;
+            }
             if (!reason)
                 continue; // keep holding
             // Quote the exit and sanity-check sell-side slippage.
@@ -358,6 +366,8 @@ function scoreCandidate(c) {
         s *= 1.2;
     if (c.crowdBoost)
         s *= 1.15;
+    if (c.momentumBoost)
+        s *= 1.05; // sentiment blowing our way
     // The leader's whole book lives at 0.35–0.80: where information edges are
     // largest and payoffs aren't lottery-shaped. Prefer that band.
     if (c.spotPrice >= 0.35 && c.spotPrice <= 0.80)
@@ -373,6 +383,12 @@ function computeCrowdBoost(outcomeIdx, buyVol0, buyVol1) {
     const ours = outcomeIdx === 0 ? buyVol0 : buyVol1;
     const theirs = outcomeIdx === 0 ? buyVol1 : buyVol0;
     return theirs > 20 && theirs > ours * 3;
+}
+/** Crowd-with-us: rivals are piling onto OUR side — sentiment confirmation. */
+function computeMomentumBoost(outcomeIdx, buyVol0, buyVol1) {
+    const ours = outcomeIdx === 0 ? buyVol0 : buyVol1;
+    const theirs = outcomeIdx === 0 ? buyVol1 : buyVol0;
+    return ours > 20 && ours > theirs * 3;
 }
 function hoursUntil(iso) {
     if (!iso)
@@ -426,6 +442,7 @@ async function candidateFromStoredEval(market, predictedProb) {
         outcomeIdx, effectiveProb, spotPrice, provisionalEdge,
         flowTrades24h: flow.trades24h,
         crowdBoost: computeCrowdBoost(outcomeIdx, flow.buyVolOutcome0, flow.buyVolOutcome1),
+        momentumBoost: computeMomentumBoost(outcomeIdx, flow.buyVolOutcome0, flow.buyVolOutcome1),
     };
 }
 async function evaluateMarkets(markets, guardrails) {
@@ -502,6 +519,7 @@ async function evaluateMarkets(markets, guardrails) {
                 market, prediction, outcomeIdx, effectiveProb, spotPrice, provisionalEdge,
                 flowTrades24h: flow.trades24h,
                 crowdBoost: computeCrowdBoost(outcomeIdx, flow.buyVolOutcome0, flow.buyVolOutcome1),
+                momentumBoost: computeMomentumBoost(outcomeIdx, flow.buyVolOutcome0, flow.buyVolOutcome1),
             });
         }
         else if (provisionalEdge > 0) {

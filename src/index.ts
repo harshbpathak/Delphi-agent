@@ -15,6 +15,7 @@ import { calculatePositionSize, netEdge, DEFAULT_GUARDRAILS, RiskGuardrails } fr
 import { postureAdjustedGuardrails } from './risk/riskPosture.js';
 import { pollAllTrades, getMarketFlow, getCompetitionPosture, CompetitionPosture } from './intelligence/marketContext.js';
 import { selfCalibrate } from './maintenance/selfCalibrate.js';
+import { runDataWatchers } from './maintenance/dataWatchers.js';
 import { logEvent } from './observability/eventLog.js';
 import { startTelegram, notify } from './observability/telegram.js';
 import { startDashboard } from './observability/dashboard.js';
@@ -789,6 +790,10 @@ async function runLoop() {
     } catch (e) {
         console.warn('  Price snapshot failed:', (e as Error).message?.slice(0, 100));
     }
+
+    // Hard-data watchers (USGS gauges etc.) update evaluations BEFORE the
+    // exit manager runs, so brackets act on the freshest physical data.
+    await runDataWatchers(markets);
 
     await exitExhaustedPositions(markets);
 

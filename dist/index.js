@@ -362,6 +362,10 @@ function scoreCandidate(c) {
     // largest and payoffs aren't lottery-shaped. Prefer that band.
     if (c.spotPrice >= 0.35 && c.spotPrice <= 0.80)
         s *= 1.1;
+    // …and prefer riding the market's favored side (43 of the leader's 69
+    // buys are the favorite at 0.50–0.75) over fighting the crowd.
+    if (c.spotPrice >= 0.50)
+        s *= 1.08;
     return s;
 }
 /** Crowd-against-us: rivals bought the opposite outcome ≥3× harder than ours. */

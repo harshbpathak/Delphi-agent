@@ -67,7 +67,7 @@ export function applyMarketConsensus(input: ConsensusInput): ConsensusResult {
     // outcome.
     const verifiedFact = eventConcluded && ambiguity === 'none' && hasJustification;
 
-    let w = 0.20; // always give the aggregate some respect
+    let w = 0.12; // always give the aggregate some respect
 
     // 1. Size of disagreement
     const disagreement = Math.abs(rawProb - marketProb);
@@ -75,12 +75,17 @@ export function applyMarketConsensus(input: ConsensusInput): ConsensusResult {
     else if (disagreement > 0.30) w += 0.20;
     else if (disagreement > 0.15) w += 0.10;
 
-    // 2. Time pressure — the crowd has had maximum opportunity to be right,
-    //    and little time remains for our thesis to be vindicated by events.
+    // 2. Time pressure — matters in proportion to how wrong we claim the
+    //    crowd is. A LARGE disagreement near the deadline is almost always our
+    //    misreading (the Astra case). A SMALL edge near the deadline is the
+    //    normal shape of late information (fresh forecasts, lineups) and must
+    //    not be taxed away, so the adder scales with the disagreement.
     if (hoursToResolve !== null) {
-        if (hoursToResolve < 6) w += 0.25;
-        else if (hoursToResolve < 24) w += 0.15;
-        else if (hoursToResolve < 72) w += 0.05;
+        let timeAdd = 0;
+        if (hoursToResolve < 6) timeAdd = 0.25;
+        else if (hoursToResolve < 24) timeAdd = 0.15;
+        else if (hoursToResolve < 72) timeAdd = 0.05;
+        w += timeAdd * Math.min(1, disagreement / 0.25);
     }
 
     // 3. Depth of aggregation

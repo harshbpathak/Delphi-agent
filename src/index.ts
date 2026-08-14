@@ -6,7 +6,7 @@ import {
     getLastEvaluation, saveEvaluation,
     recordTrade, recordSettlement, recentSettledPnl, performanceSnapshot,
     openCostByCategory, getOpenEntry, performanceStats,
-    settlementExists, getOpenCost, recordPriceSnapshots,
+    settlementExists, getOpenCost, recordPriceSnapshots, getMarketVolatility,
 } from './persistence/db.js';
 import { scanOpenMarkets, EnrichedMarket } from './execution/marketScanner.js';
 import { scrapeNews, commitArticles, ScrapedArticle } from './ingestion/rssScraper.js';
@@ -16,6 +16,7 @@ import { postureAdjustedGuardrails } from './risk/riskPosture.js';
 import { pollAllTrades, getMarketFlow, getCompetitionPosture, CompetitionPosture } from './intelligence/marketContext.js';
 import { selfCalibrate } from './maintenance/selfCalibrate.js';
 import { runDataWatchers, heldMarketsNeedingRecheck, RECHECK_HOURS } from './maintenance/dataWatchers.js';
+import { runStrategyReview } from './maintenance/strategyReview.js';
 import { logEvent } from './observability/eventLog.js';
 import { startTelegram, notify } from './observability/telegram.js';
 import { startDashboard } from './observability/dashboard.js';
@@ -197,7 +198,21 @@ async function sweepSettledPositions() {
 
 // ─── Exit Manager: stop-loss / free-roll / edge-exhausted ────────────────────
 const EXIT_EDGE_THRESHOLD = 0.01;   // Backstop: full exit when remaining net edge < 1%
-const STOP_LOSS_PCT = 0.30;         // Hard stop: cut any position down 30% from entry
+const STOP_LOSS_PCT = 0.30;         // Fallback stop when a market has too little price history
+const STOP_LOSS_VOL_MULT = 3.5;     // Vol-scaled stop: cut at 3.5× the market's realized daily vol
+const STOP_LOSS_MIN = 0.12;         // ...never tighter than 12%...
+const STOP_LOSS_MAX = 0.45;         // ...never looser than 45%
+
+/** Stop-loss threshold adapted to how much this market actually moves:
+ *  tight on sleepy markets (a 15% drop there is a real signal), roomy on
+ *  jumpy ones (30% is Tuesday for a crypto market). */
+async function dynamicStopLossPct(marketAddress: string, entryPrice: number | null): Promise<number> {
+    if (!entryPrice || entryPrice <= 0) return STOP_LOSS_PCT;
+    const volPoints = await getMarketVolatility(marketAddress);
+    if (volPoints === null) return STOP_LOSS_PCT;
+    const relDailyVol = volPoints / entryPrice;
+    return Math.min(STOP_LOSS_MAX, Math.max(STOP_LOSS_MIN, STOP_LOSS_VOL_MULT * relDailyVol));
+}
 const FREE_ROLL_GAIN_PCT = 0.20;    // Winner up ≥20% vs entry → recover the cost, ride the rest
 const FREE_ROLL_MAX_FRACTION = 0.70;// Never sell more than 70% of a position in the free-roll pass
 const FREE_ROLL_MIN_COST = 1.0;     // Don't bother free-rolling dust cost bases
@@ -314,8 +329,9 @@ async function exitExhaustedPositions(markets: EnrichedMarket[]) {
             }
 
             let reason: string | null = null;
-            if (gainPct !== null && gainPct <= -STOP_LOSS_PCT) {
-                reason = `STOP-LOSS (${(gainPct * 100).toFixed(1)}% vs entry ${entryPrice!.toFixed(3)})`;
+            const stopPct = await dynamicStopLossPct(market.address, entryPrice);
+            if (gainPct !== null && gainPct <= -stopPct) {
+                reason = `STOP-LOSS (${(gainPct * 100).toFixed(1)}% vs entry ${entryPrice!.toFixed(3)}, vol-scaled stop ${(stopPct * 100).toFixed(0)}%)`;
             } else if (remainingEdge !== null && remainingEdge < EXIT_EDGE_THRESHOLD) {
                 reason = `edge exhausted (${(remainingEdge * 100).toFixed(1)}%)${freeRolled ? ' — free-roll ride ends' : ''}`;
             } else if (gainPct !== null && gainPct >= PROFIT_TARGET_PCT
@@ -849,6 +865,27 @@ async function runLoop() {
     lastPosture = posture;
     const perf = await performanceStats();
     activeGuardrails = postureAdjustedGuardrails(posture, bankroll, perf);
+
+    // 12h advisory strategy review (LLM suggests, human decides).
+    const lastReview = Number(await getState('lastStrategyReviewTs')) || 0;
+    if (Date.now() - lastReview > 12 * 3600_000) {
+        await setState('lastStrategyReviewTs', String(Date.now()));
+        const holdings = await getHoldings();
+        const holdingsBlock = holdings.map(h =>
+            `- ${h.shares.toFixed(1)} × "${h.outcome}" mark ${h.mark.toFixed(2)} TST [${h.status}] — ${h.question.slice(0, 60)}`).join('\n') || '(none)';
+        const settlingSoon = markets.filter(m => {
+            const h = hoursUntil(m.settlesAt);
+            return h !== null && h < 48;
+        }).length;
+        runStrategyReview(
+            `${posture.summary}\nBankroll (cash): ${bankroll.toFixed(2)} TST | deployed mark: ${holdings.reduce((s, h) => s + h.mark, 0).toFixed(2)} TST\n` +
+            `Realized: ${perf.settled} closed, ${(perf.winRate * 100).toFixed(0)}% wins, net ${perf.netPnl.toFixed(2)} TST\n` +
+            `Risk posture: Kelly ${activeGuardrails.fractionalKelly}, max bet ${(activeGuardrails.maxSingleBetPct * 100).toFixed(0)}%\n` +
+            `Open markets scanned: ${markets.length} (${settlingSoon} settle within 48h)\n` +
+            `Daily usage: trades ${dailyTradeCount}/${MAX_DAILY_TRADES}, Gemini ${dailyGeminiCallCount}/${MAX_DAILY_GEMINI_CALLS}\n` +
+            `HOLDINGS:\n${holdingsBlock}`
+        ).catch(() => { /* advisory only — never blocks the loop */ });
+    }
 
     console.log(`📊 Found ${markets.length} open binary markets with live price data.`);
     console.log(`🌐 Situation: +${newTrades} new competitor trades indexed | ${posture.summary}`);

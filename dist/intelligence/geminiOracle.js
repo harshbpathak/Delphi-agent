@@ -71,6 +71,32 @@ CALIBRATION RULES:
 Respond with ONLY a JSON object in exactly this format (no markdown fences, no extra text):
 {"probability": <float 0.0-1.0>, "reasoning": "<2-3 sentences, naming the controlling clause>", "eventConcluded": <true|false>, "ambiguity": "none"|"minor"|"severe", "deviationJustification": "<one sentence naming the specific public fact the market is missing, or null if you have no such fact>"}`;
 }
+/**
+ * Free-form Q&A over the agent's live state — powers the Telegram /ask
+ * command. Grounded strictly in the provided context; not counted against
+ * the evaluation budget (user-triggered, low volume).
+ */
+export async function answerQuestion(question, context) {
+    if (!apiKey)
+        return 'Gemini is not configured.';
+    try {
+        const response = await ai.models.generateContent({
+            model: MODEL,
+            contents: `You are the analyst interface for MHA, an autonomous prediction-market trading agent competing on Gensyn Delphi. The user (the agent's owner) is asking a question from their phone.
+
+AGENT STATE (live):
+${context}
+
+QUESTION: ${question}
+
+Answer in plain text (no markdown headers), max ~150 words, direct and specific. Ground every claim in the state above — if the state doesn't contain the answer, say so plainly rather than guessing. Numbers matter: quote them.`,
+        });
+        return (response.text || 'No answer produced.').slice(0, 3500);
+    }
+    catch (e) {
+        return `Analyst unavailable (${(e?.message || 'error').slice(0, 80)}). Try again in a minute.`;
+    }
+}
 function extractJson(text) {
     // Model may wrap JSON in fences or prose; grab the first {...} block.
     const match = text.match(/\{[\s\S]*\}/);

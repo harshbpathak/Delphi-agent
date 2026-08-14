@@ -184,6 +184,28 @@ export async function recordPriceSnapshots(rows) {
         await db.run(`INSERT INTO price_snapshots (market, p0, p1, ts) VALUES (?, ?, ?, ?)`, [r.market.toLowerCase(), r.p0, r.p1, ts]);
     }
 }
+/** Realized daily volatility of a market's outcome-0 price, in probability
+ *  points, measured from recorded snapshots over the last 36h. Null until
+ *  enough history exists (~2h of snapshots). */
+export async function getMarketVolatility(market) {
+    const rows = await db.all(`SELECT p0, ts FROM price_snapshots WHERE market = ? AND ts > ? ORDER BY ts`, [market.toLowerCase(), Date.now() - 36 * 3600_000]);
+    if (rows.length < 24)
+        return null;
+    let sumSq = 0, n = 0;
+    for (let i = 1; i < rows.length; i++) {
+        const d = rows[i].p0 - rows[i - 1].p0;
+        sumSq += d * d;
+        n++;
+    }
+    if (n === 0)
+        return null;
+    const stepStd = Math.sqrt(sumSq / n);
+    const avgIntervalMs = (rows[rows.length - 1].ts - rows[0].ts) / n;
+    if (avgIntervalMs <= 0)
+        return null;
+    const stepsPerDay = 86_400_000 / avgIntervalMs;
+    return stepStd * Math.sqrt(stepsPerDay);
+}
 export async function storeCompetitorTrades(rows) {
     let stored = 0;
     for (const r of rows) {

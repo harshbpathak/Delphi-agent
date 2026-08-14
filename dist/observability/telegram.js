@@ -1,5 +1,6 @@
 import { getState, setState, performanceSnapshot } from '../persistence/db.js';
 import { readEvents } from './eventLog.js';
+import { answerQuestion } from '../intelligence/geminiOracle.js';
 import * as dotenv from 'dotenv';
 dotenv.config();
 /**
@@ -62,8 +63,23 @@ async function handleCommand(cmd) {
                 return 'No events yet.';
             return events.map(e => `${new Date(e.ts).toISOString().slice(11, 19)} [${e.type}] ${e.text.slice(0, 120)}`).join('\n');
         }
+        case '/ask': {
+            const question = cmd.replace(/^\/ask(@\S+)?\s*/i, '').trim();
+            if (!question)
+                return 'Usage: /ask <your question>\ne.g. /ask why did you buy the Ethereum market?';
+            const [status, holdings, perf] = await Promise.all([
+                statusProvider ? statusProvider() : Promise.resolve(''),
+                holdingsProvider ? holdingsProvider() : Promise.resolve(''),
+                performanceSnapshot(),
+            ]);
+            const recent = readEvents(25)
+                .map(e => `${new Date(e.ts).toISOString().slice(5, 16)} [${e.type}] ${e.text.slice(0, 160)}`)
+                .join('\n');
+            const context = `${status}\n\n${holdings}\n\nJournal: ${perf.totalTrades} live trades, ${perf.settled} closed, realized PnL ${perf.netPnl.toFixed(2)} TST\n\nRECENT AGENT EVENTS (newest last):\n${recent}`;
+            return answerQuestion(question, context);
+        }
         default:
-            return 'Commands: /status /holdings /pnl /halt /resume /logs';
+            return 'Commands: /status /holdings /pnl /halt /resume /logs /ask <question>';
     }
 }
 async function pollUpdates() {

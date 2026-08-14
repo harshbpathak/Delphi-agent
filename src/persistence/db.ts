@@ -262,6 +262,30 @@ export async function recordPriceSnapshots(rows: Array<{ market: string; p0: num
     }
 }
 
+/** Realized daily volatility of a market's outcome-0 price, in probability
+ *  points, measured from recorded snapshots over the last 36h. Null until
+ *  enough history exists (~2h of snapshots). */
+export async function getMarketVolatility(market: string): Promise<number | null> {
+    const rows = await db.all(
+        `SELECT p0, ts FROM price_snapshots WHERE market = ? AND ts > ? ORDER BY ts`,
+        [market.toLowerCase(), Date.now() - 36 * 3600_000]
+    ) as Array<{ p0: number; ts: number }>;
+    if (rows.length < 24) return null;
+
+    let sumSq = 0, n = 0;
+    for (let i = 1; i < rows.length; i++) {
+        const d = rows[i]!.p0 - rows[i - 1]!.p0;
+        sumSq += d * d;
+        n++;
+    }
+    if (n === 0) return null;
+    const stepStd = Math.sqrt(sumSq / n);
+    const avgIntervalMs = (rows[rows.length - 1]!.ts - rows[0]!.ts) / n;
+    if (avgIntervalMs <= 0) return null;
+    const stepsPerDay = 86_400_000 / avgIntervalMs;
+    return stepStd * Math.sqrt(stepsPerDay);
+}
+
 // ─── Competitor intelligence ─────────────────────────────────────────────────
 export interface CompetitorTradeRow {
     id: string;
